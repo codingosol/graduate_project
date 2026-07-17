@@ -1,0 +1,3 @@
+google-api-python-client
+psycopg2-binary
+python-dotenv

@@ -6,3 +6,7 @@ Part1.md
 Part2.md
 .env
 .env.*
+__pycache__/
+*.pyc
+part1/venv/
+part1/.venv/
