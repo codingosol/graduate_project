@@ -4,6 +4,8 @@ prototype.md
 YoutubeAPI.md
 Part1.md
 Part2.md
+DECISIONS.md
+CLAUDE.md
 .env
 .env.*
 !.env.example

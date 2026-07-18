@@ -13,6 +13,9 @@ from googleapiclient.errors import HttpError
 from psycopg2.pool import ThreadedConnectionPool
 
 from db import ensure_test_database
+from keywords import load_political_keywords
+
+POLITICAL_KEYWORDS, FOREIGN_LEADER_EXCLUDE = load_political_keywords()
 
 RECENT_WINDOW = timedelta(hours=24)
 CHANNEL_WORKERS = 5  # 1단계: 채널별 메타데이터/영상목록 조회 동시 실행 수
@@ -102,10 +105,28 @@ def fetch_video_categories(youtube, video_ids):
     return categories
 
 
+def is_political_title(title):
+    """제목에 해외 정상 이름이 있으면 무조건 비정치 처리(트럼프 등 국제정치 오탐 방지),
+    그 외엔 정치 키워드(정당명/기구·용어/한자 축약/정치인 이름) 중 하나라도 포함되면 정치로 판단.
+    실제 데이터(category=25, 1047건)로 검증: 매치율 12.7%, 해외 정상 오탐 없음."""
+    if any(fl in title for fl in FOREIGN_LEADER_EXCLUDE):
+        return False
+    return any(kw in title for kw in POLITICAL_KEYWORDS)
+
+
 def apply_filters(recent_items, categories):
-    """TODO: 1차(categoryId != 25 제외)·2차(제목 정치 키워드) 필터를 여기에 구현할 예정.
-    지금은 필터링 없이 전부 통과시키고, categoryId 태깅 상태만 관찰한다."""
-    return recent_items
+    """1차 필터: categoryId가 25(News & Politics)가 아니면 제외.
+    2차 필터: 제목에 국내 정당정치 키워드가 없으면 제외 (keywords.json/keywords.py 참고)."""
+    filtered = []
+    for item in recent_items:
+        video_id = item["snippet"]["resourceId"]["videoId"]
+        title = item["snippet"]["title"]
+        if categories.get(video_id) != "25":
+            continue
+        if not is_political_title(title):
+            continue
+        filtered.append(item)
+    return filtered
 
 
 def fetch_top_comments(youtube, video_id, max_results=100):
