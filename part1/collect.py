@@ -1,7 +1,9 @@
 import os
+import sys
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     api_key = os.environ.get("YOUTUBE_API_KEY")
     database_url = os.environ.get("DATABASE_URL")
     if not api_key or not database_url:
