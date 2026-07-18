@@ -7,7 +7,15 @@ import psycopg2.extras
 from dotenv import load_dotenv
 from psycopg2.pool import ThreadedConnectionPool
 
-from collect import CHANNELS, fetch_top_comments, fetch_video_categories, is_political_title, make_youtube_client
+from collect import (
+    CHANNELS,
+    COMMENT_INSERT_SQL,
+    build_comment_row,
+    fetch_top_comments,
+    fetch_video_categories,
+    is_political_title,
+    make_youtube_client,
+)
 from db import ensure_test_database
 
 # 2차 실행에서 남은 TV조선(뉴스TVCHOSUN)만 다시 처리.
@@ -95,19 +103,23 @@ def backfill_channel(youtube, conn, tracker, outlet_name, channel_id, uploads_pl
                 category_id = categories.get(video_id)
                 published_at = item["snippet"]["publishedAt"]
 
+                # 필터를 통과한 영상만 저장한다. (예전엔 필터와 무관하게 전부 INSERT해서
+                # 분석에 안 쓰는 비정치 영상 4,677건이 DB에 쌓였음)
+                if category_id != "25" or not is_political_title(title):
+                    continue
+
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO videos (video_id, channel_id, title, published_at, category_id, raw)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        INSERT INTO videos (video_id, channel_id, title, published_at, category_id)
+                        VALUES (%s, %s, %s, %s, %s)
                         ON CONFLICT (video_id) DO NOTHING
                         """,
-                        (video_id, channel_id, title, published_at, category_id, psycopg2.extras.Json(item)),
+                        (video_id, channel_id, title, published_at, category_id),
                     )
                 new_video_count += 1
 
-                political = category_id == "25" and is_political_title(title)
-                if political and not tracker.exhausted():
+                if not tracker.exhausted():
                     comments, error_reason = fetch_top_comments(youtube, video_id)
                     tracker.spend(1)
                     political_count += 1
@@ -118,30 +130,9 @@ def backfill_channel(youtube, conn, tracker, outlet_name, channel_id, uploads_pl
                                 "UPDATE videos SET comments_disabled = TRUE WHERE video_id = %s", (video_id,)
                             )
                     elif comments:
-                        rows = []
-                        for c in comments:
-                            top = c["snippet"]["topLevelComment"]
-                            snippet = top["snippet"]
-                            rows.append(
-                                (
-                                    top["id"],
-                                    video_id,
-                                    snippet["textDisplay"],
-                                    snippet["publishedAt"],
-                                    snippet["likeCount"],
-                                    psycopg2.extras.Json(c),
-                                )
-                            )
+                        rows = [build_comment_row(c, video_id) for c in comments]
                         with conn.cursor() as cur:
-                            psycopg2.extras.execute_values(
-                                cur,
-                                """
-                                INSERT INTO comments (comment_id, video_id, text, published_at, like_count, raw)
-                                VALUES %s
-                                ON CONFLICT (comment_id) DO NOTHING
-                                """,
-                                rows,
-                            )
+                            psycopg2.extras.execute_values(cur, COMMENT_INSERT_SQL, rows)
 
                 if tracker.exhausted():
                     break

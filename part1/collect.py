@@ -129,6 +129,35 @@ def apply_filters(recent_items, categories):
     return filtered
 
 
+COMMENT_INSERT_SQL = """
+    INSERT INTO comments (
+        comment_id, video_id, text, published_at, like_count,
+        author_channel_id, total_reply_count
+    )
+    VALUES %s
+    ON CONFLICT (comment_id) DO NOTHING
+"""
+
+
+def build_comment_row(comment_thread, video_id):
+    """API 응답(commentThread)에서 DB에 저장할 필드만 추출한다.
+    응답 원본(raw JSONB)은 저장하지 않음 — 대부분이 이미 별도 컬럼에 있는 값이거나
+    분석에 안 쓰는 값(etag/thumbnails/authorProfileImageUrl 등)이라 용량만 잡아먹었음.
+    text는 textDisplay가 아니라 textOriginal을 쓴다 (textDisplay엔 <br>·&quot; 같은
+    HTML이 섞여 있어 그대로 학습에 넣으면 노이즈가 됨 — 실측 23.5%가 해당)."""
+    top = comment_thread["snippet"]["topLevelComment"]
+    snippet = top["snippet"]
+    return (
+        top["id"],
+        video_id,
+        snippet.get("textOriginal") or snippet["textDisplay"],
+        snippet["publishedAt"],
+        snippet["likeCount"],
+        snippet.get("authorChannelId", {}).get("value"),
+        comment_thread["snippet"].get("totalReplyCount"),
+    )
+
+
 def fetch_top_comments(youtube, video_id, max_results=100):
     """댓글 좋아요 랭킹(likeCount) 직접 정렬 파라미터는 API에 없고, order='relevance'가
     유튜브 자체의 '인기 댓글' 순서에 가장 가까움. maxResults=100으로 1페이지만 받아
@@ -198,11 +227,11 @@ def process_video(api_key, db_pool, channel_id, item, category_id, category_name
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO videos (video_id, channel_id, title, published_at, category_id, raw)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO videos (video_id, channel_id, title, published_at, category_id)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (video_id) DO NOTHING
                 """,
-                (video_id, channel_id, title, published_at, category_id, psycopg2.extras.Json(item)),
+                (video_id, channel_id, title, published_at, category_id),
             )
 
         comments, error_reason = fetch_top_comments(youtube, video_id)
@@ -216,31 +245,10 @@ def process_video(api_key, db_pool, channel_id, item, category_id, category_name
             return {"title": title, "label": label, "comment_count": 0, "error": error_reason}
 
         if comments:
-            rows = []
-            for c in comments:
-                top = c["snippet"]["topLevelComment"]
-                snippet = top["snippet"]
-                rows.append(
-                    (
-                        top["id"],
-                        video_id,
-                        snippet["textDisplay"],
-                        snippet["publishedAt"],
-                        snippet["likeCount"],
-                        psycopg2.extras.Json(c),
-                    )
-                )
+            rows = [build_comment_row(c, video_id) for c in comments]
             # 댓글 개수만큼 INSERT를 따로 보내지 않고 한 번에 일괄 삽입 (영상당 DB 왕복 1회)
             with conn.cursor() as cur:
-                psycopg2.extras.execute_values(
-                    cur,
-                    """
-                    INSERT INTO comments (comment_id, video_id, text, published_at, like_count, raw)
-                    VALUES %s
-                    ON CONFLICT (comment_id) DO NOTHING
-                    """,
-                    rows,
-                )
+                psycopg2.extras.execute_values(cur, COMMENT_INSERT_SQL, rows)
 
         return {"title": title, "label": label, "comment_count": len(comments), "error": None}
     finally:
