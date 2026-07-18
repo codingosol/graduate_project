@@ -5,17 +5,10 @@ from pathlib import Path
 import psycopg2
 from dotenv import load_dotenv
 
-sys.stdout.reconfigure(encoding="utf-8")
-load_dotenv()
-
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 
-def main():
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        raise SystemExit("DATABASE_URL이 .env에 없습니다.")
-
+def apply_migrations(database_url: str) -> None:
     conn = psycopg2.connect(database_url)
     try:
         with conn.cursor() as cur:
@@ -53,6 +46,15 @@ def main():
         raise
     finally:
         conn.close()
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8")
+    load_dotenv()
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        raise SystemExit("DATABASE_URL이 .env에 없습니다.")
+    apply_migrations(database_url)
 
 
 if __name__ == "__main__":
