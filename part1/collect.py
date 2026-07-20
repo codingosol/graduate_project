@@ -252,6 +252,28 @@ def process_channel(api_key, outlet_name, key_type, key_value, channel_type, cut
         }
 
 
+class Timings:
+    """어디에 시간이 쓰이는지 분해해서 보기 위한 누적 계측기 (스레드 안전)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.data = {}
+
+    def add(self, key, seconds):
+        with self._lock:
+            n, total = self.data.get(key, (0, 0.0))
+            self.data[key] = (n + 1, total + seconds)
+
+    def report(self, wall, workers):
+        print(f"\n[구간별 누적 시간] (총 실행 {wall:.1f}초, 동시 {workers}개)")
+        for key, (n, total) in sorted(self.data.items(), key=lambda x: -x[1][1]):
+            print(f"  {key:22} {n:>5}회  누적 {total:>7.1f}초  평균 {total/n*1000:>6.0f}ms  "
+                  f"(병렬 반영 시 약 {total/workers:>5.1f}초)")
+
+
+TIMINGS = Timings()
+
+
 def process_video(api_key, db_pool, channel_id, item, category_id, category_name):
     """2단계 작업 (스레드에서 실행): 영상 1건의 댓글 수집 + DB 저장(영상 1행 + 댓글 일괄 삽입)."""
     video_id = item["snippet"]["resourceId"]["videoId"]
@@ -259,11 +281,14 @@ def process_video(api_key, db_pool, channel_id, item, category_id, category_name
     published_at = item["snippet"]["publishedAt"]
     label = f"{category_id} {category_name}"
 
+    t0 = time.perf_counter()
     conn = db_pool.getconn()
+    TIMINGS.add("db_pool_getconn", time.perf_counter() - t0)
     try:
         conn.autocommit = True
         youtube = make_youtube_client(api_key)
 
+        t0 = time.perf_counter()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -273,22 +298,29 @@ def process_video(api_key, db_pool, channel_id, item, category_id, category_name
                 """,
                 (video_id, channel_id, sanitize_text(title), published_at, category_id),
             )
+        TIMINGS.add("db_insert_video", time.perf_counter() - t0)
 
+        t0 = time.perf_counter()
         comments, error_reason = fetch_top_comments(youtube, video_id)
+        TIMINGS.add("api_commentThreads", time.perf_counter() - t0)
 
         if error_reason is not None:
+            t0 = time.perf_counter()
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE videos SET comments_disabled = TRUE WHERE video_id = %s",
                     (video_id,),
                 )
+            TIMINGS.add("db_update_disabled", time.perf_counter() - t0)
             return {"title": title, "label": label, "comment_count": 0, "error": error_reason}
 
         if comments:
             rows = [build_comment_row(c, video_id) for c in comments]
             # 댓글 개수만큼 INSERT를 따로 보내지 않고 한 번에 일괄 삽입 (영상당 DB 왕복 1회)
+            t0 = time.perf_counter()
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(cur, COMMENT_INSERT_SQL, rows)
+            TIMINGS.add("db_insert_comments", time.perf_counter() - t0)
 
         return {"title": title, "label": label, "comment_count": len(comments), "error": None}
     finally:
@@ -316,16 +348,20 @@ def main():
     print(f"\n수집 기준 시각(UTC): {now.isoformat()}")
     print(f"24시간 컷오프(UTC): {cutoff.isoformat()}")
 
-    db_pool = ThreadedConnectionPool(1, DB_POOL_SIZE, test_database_url)
+    # minconn을 작업자 수만큼 잡아야 한다. psycopg2의 putconn은 풀 보유 연결이 minconn 이상이면
+    # 반납된 연결을 보관하지 않고 그냥 close()해버린다. minconn=1이면 연결 1개만 남고 나머지는
+    # 매번 새로 만들게 되는데, Neon(싱가포르)까지 새 연결을 여는 데 평균 1.7초가 들어
+    # 이것이 전체 실행시간의 최대 병목이었다(계측: getconn 1,682ms vs API 139ms).
+    db_pool = ThreadedConnectionPool(DB_POOL_SIZE, DB_POOL_SIZE, test_database_url)
 
     conn = db_pool.getconn()
     conn.autocommit = True
     with conn.cursor() as cur:
-        for outlet_name in CHANNELS:
-            cur.execute(
-                "INSERT INTO outlets (outlet_name) VALUES (%s) ON CONFLICT DO NOTHING",
-                (outlet_name,),
-            )
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO outlets (outlet_name) VALUES %s ON CONFLICT DO NOTHING",
+            [(name,) for name in CHANNELS],
+        )
     db_pool.putconn(conn)
 
     # ---- 1단계: 채널별 메타데이터 + 최근 영상 목록 (채널 단위 병렬) ----
@@ -336,6 +372,7 @@ def main():
     ]
 
     print(f"\n[1단계] 채널 {len(channel_jobs)}개 메타데이터/영상목록 조회 (동시 {CHANNEL_WORKERS}개)")
+    stage1_start = time.perf_counter()
     channel_results = []
     with ThreadPoolExecutor(max_workers=CHANNEL_WORKERS) as executor:
         futures = [
@@ -344,6 +381,7 @@ def main():
         ]
         for future in as_completed(futures):
             channel_results.append(future.result())
+    stage1_elapsed = time.perf_counter() - stage1_start
 
     conn = db_pool.getconn()
     conn.autocommit = True
@@ -385,6 +423,7 @@ def main():
 
     # ---- 2단계: 전체 채널의 영상을 한 리스트로 모아 영상 단위 병렬 처리 ----
     print(f"\n[2단계] 영상 {len(video_jobs)}개 댓글 수집 (동시 {VIDEO_WORKERS}개)\n")
+    stage2_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=VIDEO_WORKERS) as executor:
         futures = [
             executor.submit(process_video, api_key, db_pool, channel_id, item, category_id, category_name)
@@ -394,9 +433,12 @@ def main():
             r = future.result()
             status = f"댓글 {r['comment_count']}개" if r["error"] is None else f"실패({r['error']})"
             print(f"  - [{r['label']}] {r['title']} → {status}")
+    stage2_elapsed = time.perf_counter() - stage2_start
 
     db_pool.closeall()
     elapsed = time.perf_counter() - start_time
+    print(f"\n[단계별] 1단계(채널/영상목록) {stage1_elapsed:.1f}초 / 2단계(댓글수집) {stage2_elapsed:.1f}초")
+    TIMINGS.report(stage2_elapsed, VIDEO_WORKERS)
     print(f"\n=== 완료: collect_test DB에 저장됨 (운영 DB 아님) — 총 소요시간 {elapsed:.1f}초 ===")
 
 

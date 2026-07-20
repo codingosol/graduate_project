@@ -37,6 +37,7 @@ from collect import (
 from db import ensure_test_database
 
 CHANNEL_WORKERS = 6  # 동시에 처리할 채널 수
+VIDEO_WORKERS = 5  # 채널 내부에서 댓글을 동시에 조회할 영상 수 (총 스레드 6x5=30)
 MAX_PAGES_PER_CHANNEL = 60  # quota로 못 멈추는 경우를 대비한 2차 안전장치 (60페이지 = 최대 3,000개 영상)
 
 # 소급 수집 하한선: 1년보다 오래된 영상은 수집하지 않는다.
@@ -229,40 +230,68 @@ def backfill_channel(api_key, db_pool, target):
                 categories = fetch_video_categories(youtube, vids)
                 tracker.spend((len(vids) + 49) // 50)
 
-                for item in older:
-                    video_id = item["snippet"]["resourceId"]["videoId"]
-                    title = item["snippet"]["title"]
-                    category_id = categories.get(video_id)
+                # 이 페이지에서 필터를 통과한 영상만 추린다
+                political = [
+                    it
+                    for it in older
+                    if categories.get(it["snippet"]["resourceId"]["videoId"]) == "25"
+                    and is_political_title(it["snippet"]["title"])
+                ]
 
-                    # 필터를 통과한 영상만 저장한다
-                    if category_id != "25" or not is_political_title(title):
-                        continue
-
-                    # 댓글 호출(1 unit) 예산을 미리 확보한다. 확인과 차감이 한 번에 일어나므로
-                    # 여러 스레드가 동시에 통과해 예산을 초과하는 일이 없다.
-                    if not tracker.try_spend(1):
-                        break
-
+                # 영상 저장은 한 번에 일괄 삽입 (페이지당 DB 왕복 1회)
+                if political:
+                    video_rows = [
+                        (
+                            it["snippet"]["resourceId"]["videoId"],
+                            channel_id,
+                            sanitize_text(it["snippet"]["title"]),
+                            it["snippet"]["publishedAt"],
+                            "25",
+                        )
+                        for it in political
+                    ]
                     with conn.cursor() as cur:
-                        cur.execute(
+                        psycopg2.extras.execute_values(
+                            cur,
                             """
                             INSERT INTO videos (video_id, channel_id, title, published_at, category_id)
-                            VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (video_id) DO NOTHING
+                            VALUES %s ON CONFLICT (video_id) DO NOTHING
                             """,
-                            (video_id, channel_id, sanitize_text(title), item["snippet"]["publishedAt"], category_id),
+                            video_rows,
                         )
-                    new_videos += 1
+                    new_videos += len(political)
 
-                    comments, err = fetch_top_comments(youtube, video_id)
-                    comment_videos += 1
-                    if err is not None:
+                # 댓글 조회는 영상 단위로 병렬 처리한다. 페이지네이션은 nextPageToken 때문에
+                # 순차일 수밖에 없지만, 한 페이지에서 추려진 영상들의 댓글 조회는 서로 독립적이라
+                # 동시에 보낼 수 있다. 이것이 채널당 처리량(직전 실측 2.44 unit/s)의 병목이었음.
+                # quota는 제출 전에 try_spend로 미리 확보하므로 예산 초과가 발생하지 않는다.
+                jobs = []
+                for it in political:
+                    if not tracker.try_spend(1):
+                        break
+                    jobs.append(it["snippet"]["resourceId"]["videoId"])
+
+                if jobs:
+                    with ThreadPoolExecutor(max_workers=VIDEO_WORKERS) as vex:
+                        fetched = list(
+                            vex.map(lambda vid: (vid, *fetch_top_comments(make_youtube_client(api_key), vid)), jobs)
+                        )
+                    comment_videos += len(fetched)
+
+                    disabled = [vid for vid, _, err in fetched if err is not None]
+                    if disabled:
                         with conn.cursor() as cur:
                             cur.execute(
-                                "UPDATE videos SET comments_disabled = TRUE WHERE video_id = %s", (video_id,)
+                                "UPDATE videos SET comments_disabled = TRUE WHERE video_id = ANY(%s)", (disabled,)
                             )
-                    elif comments:
-                        rows = [build_comment_row(c, video_id) for c in comments]
+
+                    rows = [
+                        build_comment_row(c, vid)
+                        for vid, comments, err in fetched
+                        if err is None and comments
+                        for c in comments
+                    ]
+                    if rows:
                         with conn.cursor() as cur:
                             psycopg2.extras.execute_values(cur, COMMENT_INSERT_SQL, rows)
 
@@ -306,15 +335,20 @@ def main():
         raise SystemExit("YOUTUBE_API_KEY / DATABASE_URL 환경변수가 필요합니다.")
 
     test_database_url = ensure_test_database(database_url)
-    db_pool = ThreadedConnectionPool(1, CHANNEL_WORKERS + 4, test_database_url)
+    # minconn = maxconn으로 둔다. psycopg2의 putconn은 보유 연결이 minconn 이상이면 반납된 연결을
+    # 보관하지 않고 close()하므로, minconn이 작으면 매번 새 연결을 만들게 된다
+    # (Neon까지 새 연결 생성에 평균 1.7초 — collect.py에서 최대 병목이었음).
+    pool_size = CHANNEL_WORKERS + 4
+    db_pool = ThreadedConnectionPool(pool_size, pool_size, test_database_url)
 
     conn = db_pool.getconn()
     conn.autocommit = True
     with conn.cursor() as cur:
-        for outlet_name in CHANNELS:
-            cur.execute(
-                "INSERT INTO outlets (outlet_name) VALUES (%s) ON CONFLICT DO NOTHING", (outlet_name,)
-            )
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO outlets (outlet_name) VALUES %s ON CONFLICT DO NOTHING",
+            [(name,) for name in CHANNELS],
+        )
     targets = resolve_targets(conn)
     db_pool.putconn(conn)
 
