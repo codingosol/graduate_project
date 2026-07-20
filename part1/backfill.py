@@ -1,6 +1,23 @@
+"""정치뉴스 영상을 과거로 소급 수집해 outlet 간 표본 불균형을 해소하는 도구.
+
+매일 24시간치만 모으는 collect.py와 별개의 일회성 도구.
+
+설계 원칙 (과거 사고에서 얻은 것):
+  1. 채널마다 **독립된 quota 예산**을 준다. 전체 공용 예산 하나만 뒀다가 한 채널(오마이TV)이
+     예산을 독점해버려 나머지 채널은 시작도 못 한 사고가 있었음.
+  2. quota 외에 **채널당 페이지 상한**도 둔다 (quota로 못 멈추는 경우 대비 2차 안전장치).
+  3. 채널 조회는 outlet_name이 아니라 **CHANNELS의 channel_id로 직접** 한다.
+     outlet_name은 DB에서 유일하지 않아 엉뚱한 채널을 긁은 사고가 있었음.
+  4. 채널을 **순차가 아니라 병렬**로 처리한다 (순차 처리는 너무 느림).
+     각 채널이 독립 예산을 쓰므로 스레드 간 공유 상태가 없어 경쟁 조건도 없다.
+"""
+
 import os
 import sys
-from datetime import datetime
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -15,116 +32,231 @@ from collect import (
     fetch_video_categories,
     is_political_title,
     make_youtube_client,
+    sanitize_text,
 )
 from db import ensure_test_database
 
-# 2차 실행에서 남은 TV조선(뉴스TVCHOSUN)만 다시 처리.
-# 버그: outlet_name='TV조선'이 channels 테이블에 두 행(뉴스TVCHOSUN 정상 + TVCHOSUN 제외된 잔여) 있어서
-# outlet_name만으로 조회하면 잘못된 채널이 뽑힐 수 있음 -> collect.py의 CHANNELS(정답)를 기준으로 channel_id를 직접 지정.
-TARGET_OUTLETS = ["TV조선"]
+CHANNEL_WORKERS = 6  # 동시에 처리할 채널 수
+MAX_PAGES_PER_CHANNEL = 60  # quota로 못 멈추는 경우를 대비한 2차 안전장치 (60페이지 = 최대 3,000개 영상)
 
-PER_CHANNEL_QUOTA_BUDGET = 450
-MAX_PAGES_PER_CHANNEL = 20  # quota로도 못 멈추는 경우를 대비한 2차 안전장치 (20페이지 = 최대 1,000개 영상)
+# 소급 수집 하한선: 1년보다 오래된 영상은 수집하지 않는다.
+# 업로드 빈도가 낮은 시사 채널(YTN 시사 2.5개/일, KBS시사 4.6개/일)은 같은 예산으로도
+# 과거로 훨씬 멀리 가버려서(실측 YTN 시사 638일치) 채널 간 수집 기간이 크게 어긋남.
+# 기간을 1년으로 통일해 outlet 간 비교 가능성을 확보한다.
+MAX_BACKFILL_AGE = timedelta(days=365)
+
+# 채널별 quota 예산 (unit). 정치 비율이 낮아 많이 훑어야 하는 채널일수록 크게,
+# 이미 표본이 충분한 채널은 작게 배분한다. 총합이 하루 한도(10,000)를 넘지 않도록 설계.
+#   현재 정치 영상 보유량: TV조선 459 / 채널A 395 / JTBC 345 / MBN 305 / MBC 232
+#                          연합뉴스TV 15 / YTN 12 / SBS 10 / KBS 4   <- 이쪽을 끌어올려야 함
+#   (오마이TV 7,817은 이미 과다 수집돼 이번 대상에서 제외)
+CHANNEL_BUDGETS = {
+    # (outlet, channel_type) -> quota unit
+    ("KBS News", "opinion"): 800,      # KBS시사 (정치 46%) - KBS 보강의 주력
+    ("YTN", "opinion"): 800,           # YTN 시사 (48%) - YTN 보강의 주력
+    ("SBS 뉴스", "opinion"): 800,       # SBS 시사교양 라디오 (70%) - SBS 보강의 주력
+    ("연합뉴스TV", "news"): 900,        # 보강용 시사 채널이 없어 본 채널로만 채워야 함 (8%)
+    ("KBS News", "news"): 350,         # 본 채널은 정치 비율이 낮아(3.8%) 효율이 나쁨 - 보조로만
+    ("YTN", "news"): 350,              # (5.8%)
+    ("SBS 뉴스", "news"): 350,          # (9.5%)
+    ("MBC 뉴스", "news"): 300,          # 23.3%, 232건 보유 - 소폭 보강
+    ("MBN News", "news"): 250,         # 30.7%, 305건 보유
+    ("JTBC News", "news"): 250,        # 35.0%, 345건 보유
+    ("채널A News", "news"): 200,        # 40.6%, 395건 보유
+    ("TV조선", "news"): 200,            # 46.6%, 459건 보유 - 이미 가장 많음
+}
+EXCLUDED_OUTLETS = {"오마이TV"}  # 이미 7,817건으로 과다 수집됨
 
 
 class QuotaTracker:
+    """채널별 quota 예산 추적기. 스레드 안전.
+
+    현재는 채널마다 하나씩 쓰여 스레드 간 공유되지 않지만, 나중에 채널 내부를 영상 단위로
+    병렬화하면 여러 스레드가 같은 트래커를 건드리게 된다. 그때 두 가지 경쟁 조건이 생긴다:
+      1) `used += 1`은 읽기·더하기·쓰기 3단계라 원자적이지 않아 증가분이 유실됨
+         (실측: 간격이 벌어진 상황에서 5,000회 호출 중 4,444회 유실 -> 예산의 9배를 써버림)
+      2) `if not exhausted(): spend()` 사이에 여러 스레드가 동시에 통과해 예산 초과
+         (실측: 예산 100인데 109 사용)
+    호출당 quota는 항상 1로 고정이라 비용 변동 때문이 아니라, 순전히 카운터 갱신 문제다.
+    확인과 차감을 `try_spend()` 하나로 합쳐 락 안에서 처리하면 두 문제가 동시에 해결된다.
+    """
+
     def __init__(self, budget):
         self.budget = budget
         self.used = 0
+        self._lock = threading.Lock()
+
+    def try_spend(self, units=1):
+        """예산이 남아 있으면 차감하고 True, 부족하면 아무것도 하지 않고 False."""
+        with self._lock:
+            if self.used + units > self.budget:
+                return False
+            self.used += units
+            return True
 
     def spend(self, units=1):
-        self.used += units
+        """예산 확인 없이 차감 (이미 호출한 API 비용을 사후 기록할 때)."""
+        with self._lock:
+            self.used += units
 
     def exhausted(self):
-        return self.used >= self.budget
+        with self._lock:
+            return self.used >= self.budget
 
 
-def get_target_channels(conn):
-    """outlet_name만으로 조회하면 같은 이름을 가진 잔여(제외된) 채널 행과 충돌할 수 있으므로,
-    collect.py의 CHANNELS(정답 매핑)에서 channel_id를 직접 얻어 그 채널 하나만 조회한다."""
-    results = []
-    for outlet_name in TARGET_OUTLETS:
-        key_type, key_value = CHANNELS[outlet_name][0]
-        if key_type != "id":
-            raise ValueError(
-                f"{outlet_name}은 CHANNELS에 channel_id가 아니라 {key_type}로 등록돼 있어 "
-                "channels 테이블에서 channel_id로 바로 조회할 수 없음 - CHANNELS 값을 확인할 것"
+def resolve_targets(conn):
+    """CHANNELS(정답 매핑)를 기준으로 대상 채널과 예산을 확정한다.
+    각 채널이 지금까지 어디까지 수집했는지(가장 오래된 published_at)도 함께 조회."""
+    targets = []
+    for outlet_name, keys in CHANNELS.items():
+        if outlet_name in EXCLUDED_OUTLETS:
+            continue
+        for key_type, key_value, channel_type in keys:
+            budget = CHANNEL_BUDGETS.get((outlet_name, channel_type))
+            if not budget:
+                continue
+            targets.append(
+                {
+                    "outlet_name": outlet_name,
+                    "key_type": key_type,
+                    "key_value": key_value,
+                    "channel_type": channel_type,
+                    "budget": budget,
+                }
             )
-        channel_id = key_value
+    return targets
+
+
+def backfill_channel(api_key, db_pool, target):
+    """채널 하나를 독립 예산으로 소급 수집한다 (스레드에서 실행)."""
+    outlet_name = target["outlet_name"]
+    tracker = QuotaTracker(target["budget"])
+    youtube = make_youtube_client(api_key)
+    conn = db_pool.getconn()
+    conn.autocommit = True
+
+    scanned = new_videos = comment_videos = 0
+    try:
+        # 채널 메타데이터 조회 후 등록 (channel_id 확정)
+        from collect import fetch_channel
+
+        channel = fetch_channel(youtube, target["key_type"], target["key_value"])
+        tracker.spend(1)
+        if channel is None:
+            return {**target, "error": "채널을 찾을 수 없음", "used": tracker.used}
+
+        channel_id = channel["id"]
+        channel_title = channel["snippet"]["title"]
+        uploads = channel["contentDetails"]["relatedPlaylists"]["uploads"]
+
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT c.outlet_name, c.channel_id, c.uploads_playlist_id, MIN(v.published_at)
-                FROM channels c LEFT JOIN videos v ON v.channel_id = c.channel_id
-                WHERE c.channel_id = %s
-                GROUP BY c.outlet_name, c.channel_id, c.uploads_playlist_id
+                INSERT INTO channels (channel_id, outlet_name, title, uploads_playlist_id, channel_type)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (channel_id) DO UPDATE
+                    SET title = EXCLUDED.title,
+                        uploads_playlist_id = EXCLUDED.uploads_playlist_id,
+                        channel_type = EXCLUDED.channel_type
                 """,
-                (channel_id,),
+                (channel_id, outlet_name, sanitize_text(channel_title), uploads, target["channel_type"]),
             )
-            row = cur.fetchone()
-        if row:
-            results.append(row)
-    return results
+            # 재개 지점은 backfill_cursor(실제로 훑은 가장 오래된 지점)를 쓴다.
+            # MIN(published_at)을 쓰면 "저장된 정치 영상 중 가장 오래된 것"이라, 정치 영상이
+            # 없는 구간을 훑고 지나가도 커서가 안 움직여서 매일 같은 구간을 다시 훑게 되고,
+            # 최악의 경우 예산이 다 떨어질 때까지 정치 영상을 못 찾으면 영영 과거로 못 간다.
+            # (커서가 아직 없는 기존 채널은 MIN(published_at)로 1회 폴백)
+            cur.execute(
+                """
+                SELECT COALESCE(backfill_cursor, (SELECT MIN(published_at) FROM videos WHERE channel_id = %s))
+                FROM channels WHERE channel_id = %s
+                """,
+                (channel_id, channel_id),
+            )
+            resume_from = cur.fetchone()[0]
 
+        floor = datetime.now(timezone.utc) - MAX_BACKFILL_AGE
 
-def backfill_channel(youtube, conn, tracker, outlet_name, channel_id, uploads_playlist_id, oldest_known):
-    new_video_count = 0
-    political_count = 0
-    page_token = None
-    page_count = 0
+        # 이미 1년 하한선까지 훑은 채널은 더 볼 게 없다. playlistItems는 항상 최신순으로만
+        # 페이지를 넘길 수 있어서(날짜로 바로 점프하는 파라미터가 없음) 재개 지점까지 가는 데만
+        # 수십 페이지를 써야 하므로, 여기서 조기 종료해 그 낭비를 막는다.
+        if resume_from is not None and resume_from <= floor:
+            return {
+                **target,
+                "channel_title": channel_title,
+                "scanned": 0,
+                "new_videos": 0,
+                "comment_videos": 0,
+                "used": tracker.used,
+                "cursor": resume_from,
+                "reached_floor": True,
+                "error": None,
+            }
 
-    while not tracker.exhausted() and page_count < MAX_PAGES_PER_CHANNEL:
-        resp = youtube.playlistItems().list(
-            part="snippet", playlistId=uploads_playlist_id, maxResults=50, pageToken=page_token
-        ).execute()
-        tracker.spend(1)
-        page_count += 1
+        page_token = None
+        pages = 0
+        oldest_scanned = resume_from
+        reached_floor = False
 
-        items = resp.get("items", [])
-        if not items:
-            break
+        while not tracker.exhausted() and pages < MAX_PAGES_PER_CHANNEL and not reached_floor:
+            resp = youtube.playlistItems().list(
+                part="snippet", playlistId=uploads, maxResults=50, pageToken=page_token
+            ).execute()
+            tracker.spend(1)
+            pages += 1
 
-        # 이미 수집된 구간(oldest_known 이후)은 건너뛰고, 그보다 오래된 것만 신규 처리
-        older_items = []
-        for item in items:
-            published_at = datetime.fromisoformat(item["snippet"]["publishedAt"].replace("Z", "+00:00"))
-            if oldest_known is not None and published_at >= oldest_known:
-                continue
-            older_items.append(item)
+            items = resp.get("items", [])
+            if not items:
+                break
 
-        if older_items:
-            video_ids = [it["snippet"]["resourceId"]["videoId"] for it in older_items]
-            categories = fetch_video_categories(youtube, video_ids)
-            tracker.spend((len(video_ids) + 49) // 50)
-
-            for item in older_items:
-                video_id = item["snippet"]["resourceId"]["videoId"]
-                title = item["snippet"]["title"]
-                category_id = categories.get(video_id)
-                published_at = item["snippet"]["publishedAt"]
-
-                # 필터를 통과한 영상만 저장한다. (예전엔 필터와 무관하게 전부 INSERT해서
-                # 분석에 안 쓰는 비정치 영상 4,677건이 DB에 쌓였음)
-                if category_id != "25" or not is_political_title(title):
+            # 이미 수집한 구간은 건너뛰고, 그보다 오래되면서 1년 하한선 안쪽인 것만 처리
+            older = []
+            for it in items:
+                pub = datetime.fromisoformat(it["snippet"]["publishedAt"].replace("Z", "+00:00"))
+                if resume_from is not None and pub >= resume_from:
                     continue
+                if pub < floor:
+                    # 업로드 재생목록은 최신순이므로 하한선을 만나면 이 채널은 더 볼 것이 없음
+                    reached_floor = True
+                    break
+                older.append(it)
+                if oldest_scanned is None or pub < oldest_scanned:
+                    oldest_scanned = pub
+            scanned += len(older)
 
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO videos (video_id, channel_id, title, published_at, category_id)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (video_id) DO NOTHING
-                        """,
-                        (video_id, channel_id, title, published_at, category_id),
-                    )
-                new_video_count += 1
+            if older:
+                vids = [x["snippet"]["resourceId"]["videoId"] for x in older]
+                categories = fetch_video_categories(youtube, vids)
+                tracker.spend((len(vids) + 49) // 50)
 
-                if not tracker.exhausted():
-                    comments, error_reason = fetch_top_comments(youtube, video_id)
-                    tracker.spend(1)
-                    political_count += 1
+                for item in older:
+                    video_id = item["snippet"]["resourceId"]["videoId"]
+                    title = item["snippet"]["title"]
+                    category_id = categories.get(video_id)
 
-                    if error_reason is not None:
+                    # 필터를 통과한 영상만 저장한다
+                    if category_id != "25" or not is_political_title(title):
+                        continue
+
+                    # 댓글 호출(1 unit) 예산을 미리 확보한다. 확인과 차감이 한 번에 일어나므로
+                    # 여러 스레드가 동시에 통과해 예산을 초과하는 일이 없다.
+                    if not tracker.try_spend(1):
+                        break
+
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO videos (video_id, channel_id, title, published_at, category_id)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (video_id) DO NOTHING
+                            """,
+                            (video_id, channel_id, sanitize_text(title), item["snippet"]["publishedAt"], category_id),
+                        )
+                    new_videos += 1
+
+                    comments, err = fetch_top_comments(youtube, video_id)
+                    comment_videos += 1
+                    if err is not None:
                         with conn.cursor() as cur:
                             cur.execute(
                                 "UPDATE videos SET comments_disabled = TRUE WHERE video_id = %s", (video_id,)
@@ -134,23 +266,39 @@ def backfill_channel(youtube, conn, tracker, outlet_name, channel_id, uploads_pl
                         with conn.cursor() as cur:
                             psycopg2.extras.execute_values(cur, COMMENT_INSERT_SQL, rows)
 
-                if tracker.exhausted():
-                    break
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
 
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
+        # 실제로 훑은 가장 오래된 지점을 커서로 저장 -> 다음 실행은 여기서 이어감
+        if oldest_scanned is not None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE channels SET backfill_cursor = %s WHERE channel_id = %s",
+                    (oldest_scanned, channel_id),
+                )
 
-    print(
-        f"  {outlet_name}: 신규 영상 {new_video_count}개 처리, 그중 정치뉴스(댓글수집) {political_count}개 "
-        f"(누적 사용 quota 약 {tracker.used} unit)"
-    )
-    return new_video_count, political_count
+        return {
+            **target,
+            "channel_title": channel_title,
+            "scanned": scanned,
+            "new_videos": new_videos,
+            "comment_videos": comment_videos,
+            "used": tracker.used,
+            "cursor": oldest_scanned,
+            "reached_floor": reached_floor,
+            "error": None,
+        }
+    except Exception as e:
+        return {**target, "error": f"{type(e).__name__}: {e}", "used": tracker.used}
+    finally:
+        db_pool.putconn(conn)
 
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     load_dotenv()
+    start = time.perf_counter()
 
     api_key = os.environ.get("YOUTUBE_API_KEY")
     database_url = os.environ.get("DATABASE_URL")
@@ -158,33 +306,41 @@ def main():
         raise SystemExit("YOUTUBE_API_KEY / DATABASE_URL 환경변수가 필요합니다.")
 
     test_database_url = ensure_test_database(database_url)
-    db_pool = ThreadedConnectionPool(1, 4, test_database_url)
+    db_pool = ThreadedConnectionPool(1, CHANNEL_WORKERS + 4, test_database_url)
 
     conn = db_pool.getconn()
     conn.autocommit = True
-
-    targets = get_target_channels(conn)
-    print(
-        f"대상 outlet {len(targets)}개(비율 순위 순), 채널당 quota 상한 {PER_CHANNEL_QUOTA_BUDGET} unit "
-        f"+ 페이지 상한 {MAX_PAGES_PER_CHANNEL}개\n"
-    )
-
-    youtube = make_youtube_client(api_key)
-
-    total_new = 0
-    total_political = 0
-    total_used = 0
-    for outlet_name, channel_id, uploads_playlist_id, oldest_known in targets:
-        tracker = QuotaTracker(PER_CHANNEL_QUOTA_BUDGET)  # 채널마다 독립된 예산 (한 채널이 전체를 독점 못 하도록)
-        n, p = backfill_channel(youtube, conn, tracker, outlet_name, channel_id, uploads_playlist_id, oldest_known)
-        total_new += n
-        total_political += p
-        total_used += tracker.used
-
+    with conn.cursor() as cur:
+        for outlet_name in CHANNELS:
+            cur.execute(
+                "INSERT INTO outlets (outlet_name) VALUES (%s) ON CONFLICT DO NOTHING", (outlet_name,)
+            )
+    targets = resolve_targets(conn)
     db_pool.putconn(conn)
-    db_pool.closeall()
 
-    print(f"\n=== 완료: 신규 영상 {total_new}개, 정치뉴스(댓글수집) {total_political}개, 총 quota 사용량 약 {total_used} unit ===")
+    total_budget = sum(t["budget"] for t in targets)
+    print(f"대상 채널 {len(targets)}개 (오마이TV 제외), 총 예산 {total_budget:,} unit, 동시 {CHANNEL_WORKERS}개 처리\n")
+
+    results = []
+    with ThreadPoolExecutor(max_workers=CHANNEL_WORKERS) as ex:
+        futures = [ex.submit(backfill_channel, api_key, db_pool, t) for t in targets]
+        for f in as_completed(futures):
+            r = f.result()
+            results.append(r)
+            if r.get("error"):
+                print(f"  [실패] {r['outlet_name']}({r['channel_type']}): {r['error']} (사용 {r['used']})")
+            else:
+                floor_mark = " [1년 하한 도달]" if r.get("reached_floor") else ""
+                cur_date = r["cursor"].date() if r.get("cursor") else "-"
+                print(
+                    f"  {r['outlet_name']}({r['channel_type']}) {r['channel_title'][:18]:20} "
+                    f"신규 {r['new_videos']:>4} / 훑음 {r['scanned']:>5} / quota {r['used']:>4} / 커서 {cur_date}{floor_mark}"
+                )
+
+    db_pool.closeall()
+    used = sum(r["used"] for r in results)
+    new = sum(r.get("new_videos", 0) for r in results)
+    print(f"\n=== 완료: 신규 정치영상 {new:,}건, quota 사용 약 {used:,} unit, {time.perf_counter()-start:.0f}초 ===")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -23,29 +24,58 @@ VIDEO_WORKERS = 10  # 2단계: 영상별 댓글 조회 동시 실행 수
 DB_POOL_SIZE = VIDEO_WORKERS + 4  # ThreadedConnectionPool은 풀이 바닥나면 대기 없이 바로 예외를 던지므로,
 # 동시 작업자 수(VIDEO_WORKERS)보다 넉넉하게 잡아야 함. Neon 무료 티어 direct 한도(~100)엔 충분히 여유 있음.
 
-# outlet_name -> [(key_type, key_value), ...]
+# outlet_name -> [(key_type, key_value, channel_type), ...]
 # key_type: "handle"(@핸들) | "id"(채널ID) | "username"(레거시 /user/ 이름)
+# channel_type: "news"(스트레이트 뉴스) | "opinion"(시사·논평·라디오 프로그램)
 # 실제 채널과 다르면([실패] 로그로 확인) 여기 값만 고치면 됨.
+#
 # TV조선은 원래 계열사 채널 2개(TVCHOSUN+뉴스TVCHOSUN)였으나, TVCHOSUN(메인)은 예능/생활 콘텐츠
 # 위주라 정치뉴스 수집 효율을 위해 제외 — 뉴스 전용인 뉴스TVCHOSUN만 수집 대상으로 유지.
+#
+# SBS/KBS/YTN은 24시간 종합뉴스 채널이라 날씨·사건사고 비중이 커서 정치 비율이 극히 낮음
+# (실측 SBS 9.5% / KBS 3.8% / YTN 5.8%). 그래서 각 언론사의 시사 전문 채널을 보강용으로 추가
+# (실측 SBS 시사교양 70% / KBS시사 46% / YTN 시사 48%). 나머지 outlet은 이미 20%를 넘어 추가 안 함.
+# 이 3개는 논평 성격이라 channel_type='opinion'으로 구분해 저장 — 분석 시 장르를 나눠 볼 수 있게.
 CHANNELS = {
-    "TV조선": [("id", "UCWlV3Lz_55UaX4JsMj-z__Q")],  # 뉴스TVCHOSUN
-    "MBC 뉴스": [("username", "MBCNEWS")],
-    "YTN": [("handle", "@ytnnews24")],
-    "SBS 뉴스": [("id", "UCkinYTS9IHqOEwR1Sze2JTw")],
-    "JTBC News": [("handle", "@jtbc_news")],
-    "KBS News": [("handle", "@newskbs")],
-    "채널A News": [("handle", "@channelA-news")],
-    "MBN News": [("id", "UCG9aFJTZ-lMCHAiO1KJsirg")],
-    "오마이TV": [("id", "UClAfLVQYZSLrMAQQ_SXPVZw")],
-    "연합뉴스TV": [("handle", "@yonhapnewstv23")],
+    "TV조선": [("id", "UCWlV3Lz_55UaX4JsMj-z__Q", "news")],  # 뉴스TVCHOSUN
+    "MBC 뉴스": [("username", "MBCNEWS", "news")],
+    "YTN": [
+        ("handle", "@ytnnews24", "news"),
+        ("id", "UCvWUqUT10RiJ6W8XiruqAiQ", "opinion"),  # YTN 시사
+    ],
+    "SBS 뉴스": [
+        ("id", "UCkinYTS9IHqOEwR1Sze2JTw", "news"),
+        ("id", "UCLv3v82YNNsa8EsxrcPMjGQ", "opinion"),  # SBS 시사교양 라디오(시교라)
+    ],
+    "JTBC News": [("handle", "@jtbc_news", "news")],
+    "KBS News": [
+        ("handle", "@newskbs", "news"),
+        ("id", "UCEb31RoX5RnfYENmnyokN8A", "opinion"),  # KBS시사
+    ],
+    "채널A News": [("handle", "@channelA-news", "news")],
+    "MBN News": [("id", "UCG9aFJTZ-lMCHAiO1KJsirg", "news")],
+    "오마이TV": [("id", "UClAfLVQYZSLrMAQQ_SXPVZw", "news")],
+    "연합뉴스TV": [("handle", "@yonhapnewstv23", "news")],
 }
 
 
+_thread_local = threading.local()
+
+
 def make_youtube_client(api_key):
-    # googleapiclient의 내부 http 객체는 스레드 간 공유가 안전하지 않으므로
-    # 스레드(작업)마다 새로 생성한다. 네트워크 호출 없이 로컬에서 생성되는 작업이라 비용은 없음.
-    return build("youtube", "v3", developerKey=api_key)
+    """스레드마다 클라이언트를 하나씩만 만들어 재사용한다.
+
+    googleapiclient의 내부 http 객체는 스레드 간 공유가 안전하지 않아 스레드별로 따로 만들어야 하지만,
+    예전엔 작업(영상)마다 새로 만들고 있었음. 객체 생성 자체는 3ms로 싸도, 새 객체는 곧 새 HTTP 연결이라
+    호출마다 TLS 핸드셰이크가 새로 일어나 API 지연이 크게 늘어났음
+    (실측: 클라이언트 재사용 116ms vs 매번 새로 생성 414ms — 3.6배).
+    스레드 로컬에 캐싱해 '스레드 간 격리'와 '연결 재사용'을 동시에 만족시킨다.
+    """
+    client = getattr(_thread_local, "youtube", None)
+    if client is None:
+        client = build("youtube", "v3", developerKey=api_key)
+        _thread_local.youtube = client
+    return client
 
 
 def fetch_channel(youtube, key_type, key_value):
@@ -139,6 +169,15 @@ COMMENT_INSERT_SQL = """
 """
 
 
+def sanitize_text(value):
+    """PostgreSQL의 TEXT 타입은 NUL 바이트(0x00)를 저장할 수 없는데, 실제 유튜브 댓글·제목에
+    이 문자가 섞여 들어오는 경우가 있음(실측: SBS 뉴스 수집 중 발생해 해당 채널 전체가 실패).
+    저장 전에 제거한다."""
+    if value is None:
+        return None
+    return value.replace("\x00", "")
+
+
 def build_comment_row(comment_thread, video_id):
     """API 응답(commentThread)에서 DB에 저장할 필드만 추출한다.
     응답 원본(raw JSONB)은 저장하지 않음 — 대부분이 이미 별도 컬럼에 있는 값이거나
@@ -150,7 +189,7 @@ def build_comment_row(comment_thread, video_id):
     return (
         top["id"],
         video_id,
-        snippet.get("textOriginal") or snippet["textDisplay"],
+        sanitize_text(snippet.get("textOriginal") or snippet["textDisplay"]),
         snippet["publishedAt"],
         snippet["likeCount"],
         snippet.get("authorChannelId", {}).get("value"),
@@ -172,7 +211,7 @@ def fetch_top_comments(youtube, video_id, max_results=100):
     return resp.get("items", []), None
 
 
-def process_channel(api_key, outlet_name, key_type, key_value, cutoff):
+def process_channel(api_key, outlet_name, key_type, key_value, channel_type, cutoff):
     """1단계 작업 (스레드에서 실행): 채널 메타데이터 + 최근 영상 목록 + 카테고리 조회."""
     try:
         youtube = make_youtube_client(api_key)
@@ -198,6 +237,7 @@ def process_channel(api_key, outlet_name, key_type, key_value, cutoff):
             "outlet_name": outlet_name,
             "channel_id": channel_id,
             "channel_title": channel_title,
+            "channel_type": channel_type,
             "uploads_playlist_id": uploads_playlist_id,
             "recent_items": recent_items,
             "categories": categories,
@@ -231,7 +271,7 @@ def process_video(api_key, db_pool, channel_id, item, category_id, category_name
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (video_id) DO NOTHING
                 """,
-                (video_id, channel_id, title, published_at, category_id),
+                (video_id, channel_id, sanitize_text(title), published_at, category_id),
             )
 
         comments, error_reason = fetch_top_comments(youtube, video_id)
@@ -290,17 +330,17 @@ def main():
 
     # ---- 1단계: 채널별 메타데이터 + 최근 영상 목록 (채널 단위 병렬) ----
     channel_jobs = [
-        (outlet_name, key_type, key_value)
+        (outlet_name, key_type, key_value, channel_type)
         for outlet_name, keys in CHANNELS.items()
-        for key_type, key_value in keys
+        for key_type, key_value, channel_type in keys
     ]
 
     print(f"\n[1단계] 채널 {len(channel_jobs)}개 메타데이터/영상목록 조회 (동시 {CHANNEL_WORKERS}개)")
     channel_results = []
     with ThreadPoolExecutor(max_workers=CHANNEL_WORKERS) as executor:
         futures = [
-            executor.submit(process_channel, api_key, outlet_name, key_type, key_value, cutoff)
-            for outlet_name, key_type, key_value in channel_jobs
+            executor.submit(process_channel, api_key, outlet_name, key_type, key_value, channel_type, cutoff)
+            for outlet_name, key_type, key_value, channel_type in channel_jobs
         ]
         for future in as_completed(futures):
             channel_results.append(future.result())
@@ -320,13 +360,20 @@ def main():
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO channels (channel_id, outlet_name, title, uploads_playlist_id)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO channels (channel_id, outlet_name, title, uploads_playlist_id, channel_type)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (channel_id) DO UPDATE
                     SET title = EXCLUDED.title,
-                        uploads_playlist_id = EXCLUDED.uploads_playlist_id
+                        uploads_playlist_id = EXCLUDED.uploads_playlist_id,
+                        channel_type = EXCLUDED.channel_type
                 """,
-                (result["channel_id"], result["outlet_name"], result["channel_title"], result["uploads_playlist_id"]),
+                (
+                    result["channel_id"],
+                    result["outlet_name"],
+                    sanitize_text(result["channel_title"]),
+                    result["uploads_playlist_id"],
+                    result["channel_type"],
+                ),
             )
 
         for item in result["recent_items"]:
