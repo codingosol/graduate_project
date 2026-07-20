@@ -247,6 +247,7 @@ def backfill_channel(api_key, db_pool, target):
                             sanitize_text(it["snippet"]["title"]),
                             it["snippet"]["publishedAt"],
                             "25",
+                            True,  # 위 political 리스트가 이미 2차 필터를 통과한 것들
                         )
                         for it in political
                     ]
@@ -254,7 +255,9 @@ def backfill_channel(api_key, db_pool, target):
                         psycopg2.extras.execute_values(
                             cur,
                             """
-                            INSERT INTO videos (video_id, channel_id, title, published_at, category_id)
+                            INSERT INTO videos (
+                                video_id, channel_id, title, published_at, category_id, is_political
+                            )
                             VALUES %s ON CONFLICT (video_id) DO NOTHING
                             """,
                             video_rows,

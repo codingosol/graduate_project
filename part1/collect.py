@@ -292,8 +292,10 @@ def process_video(api_key, db_pool, channel_id, item, category_id, category_name
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO videos (video_id, channel_id, title, published_at, category_id)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO videos (
+                    video_id, channel_id, title, published_at, category_id, is_political
+                )
+                VALUES (%s, %s, %s, %s, %s, TRUE)
                 ON CONFLICT (video_id) DO NOTHING
                 """,
                 (video_id, channel_id, sanitize_text(title), published_at, category_id),

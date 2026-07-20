@@ -13,3 +13,6 @@ __pycache__/
 *.pyc
 part1/venv/
 part1/.venv/
+
+# 라벨링 툴의 미업로드 로컬 라벨 (작업 중 파일, DB가 정본)
+labeling_tool/labels_*.json
