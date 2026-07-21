@@ -18,7 +18,17 @@ from keywords import load_political_keywords
 
 POLITICAL_KEYWORDS, FOREIGN_LEADER_EXCLUDE = load_political_keywords()
 
-RECENT_WINDOW = timedelta(hours=24)
+# 수집 재개 지점(cutoff)은 "고정된 24시간"이 아니라 **채널별로 DB에 저장된 가장 최신 영상의
+# published_at**을 기준으로 계산한다. 이렇게 하면 실행이 며칠 밀리거나 한 번 건너뛰어도
+# 그 사이 구간을 자동으로 따라잡는다(고정 24시간 창은 실행 간격이 24시간을 넘는 순간 영구 공백이 생김).
+# 별도의 "수집 시각" 기록은 두지 않는다 — published_at이 이미 그 정보를 담고 있다.
+#
+# ⚠️ 반드시 채널별로 계산해야 한다. 업로드 빈도가 채널마다 크게 달라(MBC 뉴스 vs YTN 시사),
+#    전체 MAX 하나를 공용 cutoff로 쓰면 고빈도 채널이 저빈도 채널의 재개 지점을 덮어
+#    저빈도 채널이 놓친 구간을 영영 못 긁는다.
+DEFAULT_WINDOW = timedelta(hours=24)   # 아직 저장된 정치 영상이 없는 채널의 fallback 창
+OVERLAP = timedelta(hours=2)           # 재개 시 경계 누락을 막기 위해 살짝 겹쳐 훑는 여유
+MAX_LOOKBACK = timedelta(days=7)       # 재개 구간 상한. 이보다 벌어지면 backfill의 영역이라 경고
 CHANNEL_WORKERS = 5  # 1단계: 채널별 메타데이터/영상목록 조회 동시 실행 수
 VIDEO_WORKERS = 10  # 2단계: 영상별 댓글 조회 동시 실행 수
 DB_POOL_SIZE = VIDEO_WORKERS + 4  # ThreadedConnectionPool은 풀이 바닥나면 대기 없이 바로 예외를 던지므로,
@@ -211,8 +221,31 @@ def fetch_top_comments(youtube, video_id, max_results=100):
     return resp.get("items", []), None
 
 
-def process_channel(api_key, outlet_name, key_type, key_value, channel_type, cutoff):
-    """1단계 작업 (스레드에서 실행): 채널 메타데이터 + 최근 영상 목록 + 카테고리 조회."""
+def resume_cutoff(watermarks, channel_id, now):
+    """이 채널을 어디까지 다시 훑을지(cutoff)를 계산한다.
+
+    watermarks[channel_id] = 이 채널의 DB 내 가장 최신 정치 영상 published_at.
+      - 없으면(새 채널·정치 영상 0건): now - DEFAULT_WINDOW(24시간) fallback.
+      - 있으면: 그 시점부터 재개하되 OVERLAP만큼 겹쳐 훑는다. 단 MAX_LOOKBACK을 넘으면 상한으로 자른다.
+
+    반환: (cutoff, note)  — note는 로그용 상태 문자열.
+    """
+    wm = watermarks.get(channel_id)
+    if wm is None:
+        return now - DEFAULT_WINDOW, "신규(24h fallback)"
+    cutoff = wm - OVERLAP
+    floor = now - MAX_LOOKBACK
+    if cutoff < floor:
+        return floor, f"⚠️상한적용({(now - wm).days}일 밀림 — backfill 권장)"
+    return cutoff, f"재개(최신 {wm.strftime('%m/%d %H:%M')} 이후)"
+
+
+def process_channel(api_key, outlet_name, key_type, key_value, channel_type, watermarks, now):
+    """1단계 작업 (스레드에서 실행): 채널 메타데이터 + 최근 영상 목록 + 카테고리 조회.
+
+    cutoff는 고정값이 아니라 이 채널의 DB 최신 영상(watermarks)을 기준으로 여기서 계산한다.
+    handle/username 채널은 channel_id가 fetch_channel 이후에야 확정되므로 그 뒤에 계산해야 한다.
+    """
     try:
         youtube = make_youtube_client(api_key)
         channel = fetch_channel(youtube, key_type, key_value)
@@ -228,6 +261,7 @@ def process_channel(api_key, outlet_name, key_type, key_value, channel_type, cut
         channel_title = channel["snippet"]["title"]
         uploads_playlist_id = channel["contentDetails"]["relatedPlaylists"]["uploads"]
 
+        cutoff, cutoff_note = resume_cutoff(watermarks, channel_id, now)
         recent_items = fetch_recent_videos(youtube, uploads_playlist_id, cutoff)
         video_ids = [it["snippet"]["resourceId"]["videoId"] for it in recent_items]
         categories = fetch_video_categories(youtube, video_ids) if video_ids else {}
@@ -241,6 +275,7 @@ def process_channel(api_key, outlet_name, key_type, key_value, channel_type, cut
             "uploads_playlist_id": uploads_playlist_id,
             "recent_items": recent_items,
             "categories": categories,
+            "cutoff_note": cutoff_note,
             "error": None,
         }
     except Exception as e:
@@ -346,9 +381,7 @@ def main():
     category_names = fetch_category_names(bootstrap_youtube)
 
     now = datetime.now(timezone.utc)
-    cutoff = now - RECENT_WINDOW
     print(f"\n수집 기준 시각(UTC): {now.isoformat()}")
-    print(f"24시간 컷오프(UTC): {cutoff.isoformat()}")
 
     # minconn을 작업자 수만큼 잡아야 한다. psycopg2의 putconn은 풀 보유 연결이 minconn 이상이면
     # 반납된 연결을 보관하지 않고 그냥 close()해버린다. minconn=1이면 연결 1개만 남고 나머지는
@@ -364,7 +397,13 @@ def main():
             "INSERT INTO outlets (outlet_name) VALUES %s ON CONFLICT DO NOTHING",
             [(name,) for name in CHANNELS],
         )
+        # 채널별 재개 지점(watermark): 이미 저장된 가장 최신 영상의 published_at.
+        # 이 값 이후부터만 다시 훑으므로 실행이 밀려도 그 사이를 따라잡는다.
+        cur.execute("SELECT channel_id, max(published_at) FROM videos GROUP BY channel_id")
+        watermarks = dict(cur.fetchall())
     db_pool.putconn(conn)
+    print(f"재개 기준: 채널별 최신 영상 published_at (watermark {len(watermarks)}개, "
+          f"신규 채널은 {int(DEFAULT_WINDOW.total_seconds() // 3600)}h fallback)")
 
     # ---- 1단계: 채널별 메타데이터 + 최근 영상 목록 (채널 단위 병렬) ----
     channel_jobs = [
@@ -378,7 +417,8 @@ def main():
     channel_results = []
     with ThreadPoolExecutor(max_workers=CHANNEL_WORKERS) as executor:
         futures = [
-            executor.submit(process_channel, api_key, outlet_name, key_type, key_value, channel_type, cutoff)
+            executor.submit(process_channel, api_key, outlet_name, key_type, key_value,
+                            channel_type, watermarks, now)
             for outlet_name, key_type, key_value, channel_type in channel_jobs
         ]
         for future in as_completed(futures):
@@ -395,7 +435,8 @@ def main():
 
         print(
             f"  채널: {result['channel_title']} ({result['channel_id']}) "
-            f"- outlet: {result['outlet_name']} - 24시간 내 {len(result['recent_items'])}개"
+            f"- outlet: {result['outlet_name']} - {result['cutoff_note']} "
+            f"- 정치영상 {len(result['recent_items'])}개"
         )
         with conn.cursor() as cur:
             cur.execute(
