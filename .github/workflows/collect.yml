@@ -1,23 +1,47 @@
-name: daily-youtube-collect
+name: daily-collect
+
+# 매일 자동으로 도는 것은 "수집 + 필터 + 저장"까지다.
+#   channels.list → playlistItems.list → 1차 필터(categoryId=25) → 2차 필터(제목 키워드)
+#   → commentThreads.list → Neon 적재
+#
+# 좌/우/중립/사용불가 성향 분류는 이 워크플로우에 넣지 않는다.
+#   - 학습은 로컬 GPU(러너엔 GPU 없음), 추론도 로컬 배치로 별도 수행한다.
+#   - 즉 이 CI는 "원본 댓글을 계속 쌓기만" 하고, 분류는 나중에 따로 돌린다.
+#   (근거: DECISIONS.md 2026-07-20 "학습·추론 실행 위치")
 
 on:
   schedule:
-    - cron: '0 18 * * *'   # 매일 UTC 18:00 = 한국시간 새벽 3시
-  workflow_dispatch:
+    - cron: '0 18 * * *'   # 매일 UTC 18:00 = KST 03:00. 실행 시점 기준 최근 24시간을 수집
+  workflow_dispatch:        # 필요 시 수동 실행
+
+# 이전 실행이 아직 돌고 있으면 겹쳐 돌리지 않는다(중복 수집·쿼터 낭비 방지)
+concurrency:
+  group: daily-collect
+  cancel-in-progress: false
 
 jobs:
   collect:
     runs-on: ubuntu-latest
+    timeout-minutes: 30     # 수집은 보통 수십 초~수 분. 매달려 쿼터/시간을 태우지 않도록 상한
     defaults:
       run:
         working-directory: part1
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: python collect.py
+          cache: pip
+          cache-dependency-path: part1/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect (24h window -> filter -> store)
+        run: python collect.py
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # collect.py는 현재 ensure_test_database()로 collect_test DB에만 적재한다.
+          # 운영 DB 전환은 필터 검증 완료 후 별도로 진행(Part1.md 3. 인프라 참고).
