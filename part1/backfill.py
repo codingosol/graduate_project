@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -42,36 +42,44 @@ MAX_PAGES_PER_CHANNEL = 600  # 2차 안전장치. 페이지도 quota에서 차�
 # 실제 제한은 예산이고, 이 값은 예산보다 크게 둬서 "예산이 먼저 소진되도록" 한다.
 # (너무 작으면 예산을 다 쓰기 전에 페이지 상한에 걸려 소급이 얕게 끝남)
 
-# 소급 수집 하한선: 1년보다 오래된 영상은 수집하지 않는다.
-# 업로드 빈도가 낮은 시사 채널(YTN 시사 2.5개/일, KBS시사 4.6개/일)은 같은 예산으로도
-# 과거로 훨씬 멀리 가버려서(실측 YTN 시사 638일치) 채널 간 수집 기간이 크게 어긋남.
-# 기간을 1년으로 통일해 outlet 간 비교 가능성을 확보한다.
-MAX_BACKFILL_AGE = timedelta(days=365)
+# 소급 수집 하한선. prune.py와 **같은 값을 공유**한다.
+# 하한을 두 곳에 따로 적으면 backfill이 긁어온 구간을 prune이 곧바로 지우거나 그 반대가 되므로,
+# 반드시 한 곳에서만 정의한다.
+#
+# 1년(365일)에서 3개월 고정 날짜로 바꾼 이유:
+#   무료 티어 512MB에서 1년치는 물리적으로 불가능하다. 실측으로 영상 1편 = 약 8.5KB인데
+#   news 채널은 월 700~1,850편을 올린다. 9개 채널을 1년까지 채우면 12만~14만 편(1.3GB급)이라
+#   담을 수 있는 최대치의 4배다. 쿼터가 아니라 저장 용량이 먼저 터진다.
+#   목적이 '채널 간 비교'인 이상 깊이보다 **모든 채널이 같은 기간을 커버하는 것**이 중요하므로,
+#   전 채널 공통 하한을 2026-04-21(약 3개월)로 통일했다.
+from prune import RETENTION_FLOOR
 
-# 채널별 quota 예산 (unit). 이번 실행(2026-07-21)은 남은 quota 약 6,000을 대상 채널에
-# **골고루** 배분한다. 채널당 550 x 10채널 = 5,500 (약 500 unit 안전 버퍼).
+BACKFILL_FLOOR = datetime.fromisoformat(RETENTION_FLOOR).replace(tzinfo=timezone.utc)
+
+# 채널별 quota 예산 (unit). 이번 실행(2026-07-21 2회차)은 일일 수집분을 넉넉히 남기려고
+# 총 8,000 unit을 상한으로 두고 대상 채널에 **골고루** 배분한다. 880 x 9채널 = 7,920.
 #   ※ 페이지·카테고리·댓글이 모두 예산에서 차감되므로 이 숫자가 곧 실제 quota 소모 상한이다.
 #
-# YTN 시사·KBS시사(opinion)는 이미 1년 하한선(2025-07-21)까지 소급 완료돼 예산을 줘도
-# 즉시 조기종료하므로 이번 대상에서 뺀다(딕셔너리에서 제외 = resolve_targets에서 스킵).
-# 오마이TV는 이미 7,920건으로 과다 수집돼 EXCLUDED_OUTLETS로 제외.
+# 대상에서 빠진 채널(딕셔너리에 없으면 resolve_targets가 스킵):
+#   - KBS시사·YTN시사·SBS시교라(opinion): 원래 하한(1년)까지 내려가 있었고, 2026-04-21 프루닝
+#     이후 가장 오래된 영상이 정확히 하한선이라 이미 목표 기간을 채웠다.
+#   - 오마이TV: 과다 수집(프루닝 후에도 4,054편)이라 EXCLUDED_OUTLETS로 제외.
 #
-# 각 채널 현재 커서(가장 오래 훑은 지점): SBS시교라 26-04-07(가장 깊음), 나머지는 26-07-01~11.
-# 전부 하한선(25-07-21)보다 한참 위라, 10채널 모두 예산을 소진할 때까지 과거로 내려간다.
+# 남은 9개 news 채널은 커서가 26-06-18~07-02이라 하한(26-04-21)까지 약 2개월이 남아 있다.
+# 채널당 880 unit으로는 하루에 다 못 내려가므로 며칠에 나눠 실행한다(조기종료 안 함).
 CHANNEL_BUDGETS = {
-    # (outlet, channel_type) -> quota unit  (골고루 550씩)
-    ("SBS 뉴스", "opinion"): 550,       # 시교라 (커서 26-04-07, 가장 깊게 내려가 있음)
-    ("연합뉴스TV", "news"): 550,
-    ("KBS News", "news"): 550,
-    ("YTN", "news"): 550,
-    ("SBS 뉴스", "news"): 550,
-    ("MBC 뉴스", "news"): 550,
-    ("MBN News", "news"): 550,
-    ("JTBC News", "news"): 550,
-    ("채널A News", "news"): 550,
-    ("TV조선", "news"): 550,
+    # (outlet, channel_type) -> quota unit  (골고루 880씩, 합계 7,920)
+    ("연합뉴스TV", "news"): 880,
+    ("KBS News", "news"): 880,
+    ("YTN", "news"): 880,
+    ("SBS 뉴스", "news"): 880,
+    ("MBC 뉴스", "news"): 880,
+    ("MBN News", "news"): 880,
+    ("JTBC News", "news"): 880,
+    ("채널A News", "news"): 880,
+    ("TV조선", "news"): 880,
 }
-EXCLUDED_OUTLETS = {"오마이TV"}  # 이미 7,920건으로 과다 수집됨
+EXCLUDED_OUTLETS = {"오마이TV"}  # 프루닝 후에도 4,054편으로 다른 채널의 2~4배
 
 
 class QuotaTracker:
@@ -181,9 +189,9 @@ def backfill_channel(api_key, db_pool, target):
             )
             resume_from = cur.fetchone()[0]
 
-        floor = datetime.now(timezone.utc) - MAX_BACKFILL_AGE
+        floor = BACKFILL_FLOOR
 
-        # 이미 1년 하한선까지 훑은 채널은 더 볼 게 없다. playlistItems는 항상 최신순으로만
+        # 이미 하한선까지 훑은 채널은 더 볼 게 없다. playlistItems는 항상 최신순으로만
         # 페이지를 넘길 수 있어서(날짜로 바로 점프하는 파라미터가 없음) 재개 지점까지 가는 데만
         # 수십 페이지를 써야 하므로, 여기서 조기 종료해 그 낭비를 막는다.
         if resume_from is not None and resume_from <= floor:
@@ -215,7 +223,7 @@ def backfill_channel(api_key, db_pool, target):
             if not items:
                 break
 
-            # 이미 수집한 구간은 건너뛰고, 그보다 오래되면서 1년 하한선 안쪽인 것만 처리
+            # 이미 수집한 구간은 건너뛰고, 그보다 오래되면서 하한선 안쪽인 것만 처리
             older = []
             for it in items:
                 pub = datetime.fromisoformat(it["snippet"]["publishedAt"].replace("Z", "+00:00"))
@@ -372,7 +380,7 @@ def main():
             if r.get("error"):
                 print(f"  [실패] {r['outlet_name']}({r['channel_type']}): {r['error']} (사용 {r['used']})")
             else:
-                floor_mark = " [1년 하한 도달]" if r.get("reached_floor") else ""
+                floor_mark = f" [하한 {RETENTION_FLOOR} 도달]" if r.get("reached_floor") else ""
                 cur_date = r["cursor"].date() if r.get("cursor") else "-"
                 print(
                     f"  {r['outlet_name']}({r['channel_type']}) {r['channel_title'][:18]:20} "
