@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -207,6 +208,50 @@ def build_comment_row(comment_thread, video_id):
     )
 
 
+# 영상당 저장할 댓글 수. API는 여전히 1페이지(최대 100건)를 받아오지만
+# (페이지 단위 과금이라 적게 요청해도 quota가 안 줄어든다), **저장은 20건만** 한다.
+#
+# 왜 자르는가:
+#   Neon 무료 티어 512MB에서 영상 1편이 13.4KB(실측)를 먹어, 하한선까지 소급하면 615MB로
+#   한도를 넘는다. 게다가 한 영상 안의 댓글은 같은 주제·같은 시청자라 서로 강하게 상관돼서
+#   41건이 41개의 독립 표본이 아니다. 채널 성향 추정에는 **영상 수**가 훨씬 값지므로
+#   댓글 밀도를 줄이고 기간을 지키는 쪽을 택했다.
+#
+# 왜 '상위 10 + 무작위 10'인가 (층화 표집):
+#   - 좋아요 상위만 남기면: 좋아요 총량의 78%를 잡아 '댓글은 안 달고 좋아요만 누르는 다수'의
+#     여론을 잘 담지만, 남는 것이 짧고 자극적인 고참여 댓글뿐이라(평균 좋아요 154.7 vs 11.2,
+#     대댓글 2.92 vs 0.21) 전체 분포가 왜곡되고 소수 의견이 사라진다. 이미 매긴 라벨 850건은
+#     전체 풀에서 뽑은 것이라 학습/추론 분포도 어긋난다. **무가중 분석이 영원히 불가능해진다.**
+#   - 무작위만 남기면: 분포는 지켜지지만 좋아요 3,000개짜리 대표 댓글이 탈락해
+#     좋아요 가중 분석의 정밀도가 떨어진다.
+#   두 층을 반씩 남기면 둘 다 살아남고, 남은 20건을 좋아요로 정렬하면 상위 10건이 곧
+#   그 영상의 원래 상위 10건이라 **별도 컬럼 없이 층을 되살릴 수 있다.**
+KEEP_TOP = 10
+KEEP_RANDOM = 10
+
+
+def select_comments(comment_threads):
+    """저장할 댓글만 고른다 (좋아요 상위 KEEP_TOP + 나머지에서 무작위 KEEP_RANDOM).
+
+    무작위는 comment_id 해시로 정한다 — 실행할 때마다 달라지는 난수를 쓰면 같은 영상을
+    다시 수집했을 때 다른 댓글이 뽑혀 표집 규칙이 시점마다 달라진다.
+    """
+    if len(comment_threads) <= KEEP_TOP + KEEP_RANDOM:
+        return comment_threads
+
+    def like_of(t):
+        return t["snippet"]["topLevelComment"]["snippet"]["likeCount"]
+
+    def id_of(t):
+        return t["snippet"]["topLevelComment"]["id"]
+
+    # 좋아요 동점일 때 순서가 응답 순서에 좌우되지 않도록 id를 2차 기준으로 둔다.
+    ordered = sorted(comment_threads, key=lambda t: (-like_of(t), id_of(t)))
+    top = ordered[:KEEP_TOP]
+    rest = sorted(ordered[KEEP_TOP:], key=lambda t: hashlib.md5(id_of(t).encode()).hexdigest())
+    return top + rest[:KEEP_RANDOM]
+
+
 def fetch_top_comments(youtube, video_id, max_results=100):
     """댓글 좋아요 랭킹(likeCount) 직접 정렬 파라미터는 API에 없고, order='relevance'가
     유튜브 자체의 '인기 댓글' 순서에 가장 가까움. maxResults=100으로 1페이지만 받아
@@ -352,7 +397,7 @@ def process_video(api_key, db_pool, channel_id, item, category_id, category_name
             return {"title": title, "label": label, "comment_count": 0, "error": error_reason}
 
         if comments:
-            rows = [build_comment_row(c, video_id) for c in comments]
+            rows = [build_comment_row(c, video_id) for c in select_comments(comments)]
             # 댓글 개수만큼 INSERT를 따로 보내지 않고 한 번에 일괄 삽입 (영상당 DB 왕복 1회)
             t0 = time.perf_counter()
             with conn.cursor() as cur:

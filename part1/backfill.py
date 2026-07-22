@@ -33,6 +33,7 @@ from collect import (
     is_political_title,
     make_youtube_client,
     sanitize_text,
+    select_comments,
 )
 from db import ensure_test_database
 
@@ -305,7 +306,7 @@ def backfill_channel(api_key, db_pool, target):
                         build_comment_row(c, vid)
                         for vid, comments, err in fetched
                         if err is None and comments
-                        for c in comments
+                        for c in select_comments(comments)  # 영상당 20건만 저장 (collect.py 참고)
                     ]
                     if rows:
                         with conn.cursor() as cur:
