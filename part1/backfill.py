@@ -57,30 +57,30 @@ from prune import RETENTION_FLOOR
 
 BACKFILL_FLOOR = datetime.fromisoformat(RETENTION_FLOOR).replace(tzinfo=timezone.utc)
 
-# 채널별 quota 예산 (unit). 이번 실행(2026-07-21 2회차)은 일일 수집분을 넉넉히 남기려고
-# 총 8,000 unit을 상한으로 두고 대상 채널에 **골고루** 배분한다. 880 x 9채널 = 7,920.
+# 한 번 실행에 쓸 총 quota. 일일 수집분(약 300~500 unit)을 남기려고 8,000 아래로 둔다.
 #   ※ 페이지·카테고리·댓글이 모두 예산에서 차감되므로 이 숫자가 곧 실제 quota 소모 상한이다.
+TOTAL_BUDGET = 7920
+
+# 대상 채널 (outlet, channel_type). 예산은 실행할 때마다 **남은 기간에 따라 자동 배분**한다.
 #
-# 대상에서 빠진 채널(딕셔너리에 없으면 resolve_targets가 스킵):
-#   - KBS시사·YTN시사·SBS시교라(opinion): 원래 하한(1년)까지 내려가 있었고, 2026-04-21 프루닝
-#     이후 가장 오래된 영상이 정확히 하한선이라 이미 목표 기간을 채웠다.
+# 대상에서 빠진 채널:
+#   - KBS시사·YTN시사·SBS시교라(opinion): 이미 하한까지 내려가 있다.
 #   - 오마이TV: 과다 수집(프루닝 후에도 4,054편)이라 EXCLUDED_OUTLETS로 제외.
-#
-# 남은 9개 news 채널은 커서가 26-06-18~07-02이라 하한(26-04-21)까지 약 2개월이 남아 있다.
-# 채널당 880 unit으로는 하루에 다 못 내려가므로 며칠에 나눠 실행한다(조기종료 안 함).
-CHANNEL_BUDGETS = {
-    # (outlet, channel_type) -> quota unit  (골고루 880씩, 합계 7,920)
-    ("연합뉴스TV", "news"): 880,
-    ("KBS News", "news"): 880,
-    ("YTN", "news"): 880,
-    ("SBS 뉴스", "news"): 880,
-    ("MBC 뉴스", "news"): 880,
-    ("MBN News", "news"): 880,
-    ("JTBC News", "news"): 880,
-    ("채널A News", "news"): 880,
-    ("TV조선", "news"): 880,
+TARGET_CHANNELS = {
+    ("연합뉴스TV", "news"), ("KBS News", "news"), ("YTN", "news"),
+    ("SBS 뉴스", "news"), ("MBC 뉴스", "news"), ("MBN News", "news"),
+    ("JTBC News", "news"), ("채널A News", "news"), ("TV조선", "news"),
 }
 EXCLUDED_OUTLETS = {"오마이TV"}  # 프루닝 후에도 4,054편으로 다른 채널의 2~4배
+
+# 하루치 소급에 드는 quota. 실측(2026-07-24): 7,373 unit으로 9채널 합계 100일 진행 = 74 unit/일.
+# 채널별로 58~98로 갈리므로(영상 밀도 차이) 여유를 둬 90으로 잡는다.
+UNITS_PER_DAY = 90
+
+# 채널당 최소 예산. playlistItems는 날짜로 점프할 수 없어 **매 실행마다 1페이지부터 다시 넘겨**
+# 커서 위치까지 도달해야 한다. 커서가 깊을수록 이 통과 비용만 100 unit을 넘으므로,
+# 이보다 적게 주면 커서에 닿기도 전에 예산이 끝나 아무 진전이 없다.
+MIN_CHANNEL_BUDGET = 300
 
 
 class QuotaTracker:
@@ -119,27 +119,72 @@ class QuotaTracker:
             return self.used >= self.budget
 
 
-def resolve_targets(conn):
-    """CHANNELS(정답 매핑)를 기준으로 대상 채널과 예산을 확정한다.
-    각 채널이 지금까지 어디까지 수집했는지(가장 오래된 published_at)도 함께 조회."""
-    targets = []
+def resolve_targets(conn, total_budget=TOTAL_BUDGET):
+    """대상 채널을 고르고 **남은 기간에 비례해 예산을 자동 배분**한다.
+
+    왜 자동인가:
+      예전에는 채널마다 880씩 손으로 적어 뒀는데, 하한에 도달한 채널이 생기면 그 몫이
+      그대로 놀았다(완주 채널은 1 unit만 쓰고 조기 종료하므로). 2026-07-24에 SBS·MBN이
+      완주해 다음 실행부터 1,758 unit이 낭비될 상황이었다. 남은 기간을 DB에서 읽어
+      배분하면 상수를 매번 손볼 필요가 없고 낭비도 없다.
+
+    배분 방식 — 완주에 가까운 채널부터 필요량을 채운다:
+      1. 활성 채널마다 MIN_CHANNEL_BUDGET을 먼저 깔아 준다(커서까지 통과하는 비용).
+      2. 남은 예산을 **필요량이 적은 채널부터** 순서대로 채운다.
+      기간이 짧게 남은 채널을 먼저 끝내면 다음 실행부터 그 채널의 통과 비용이 통째로
+      사라진다. 균등 배분은 모두를 어중간하게 남겨 그 낭비가 계속된다.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT outlet_name, channel_type,
+               GREATEST((backfill_cursor::date - %s::date), 0) AS days_left
+        FROM channels
+        """,
+        (RETENTION_FLOOR,),
+    )
+    # 커서가 없는 채널(아직 한 번도 안 훑음)은 전 구간이 남은 것으로 본다.
+    full_span = (datetime.now(timezone.utc).date() - BACKFILL_FLOOR.date()).days
+    days_left = {(o, t): (d if d is not None else full_span) for o, t, d in cur.fetchall()}
+
+    active = []
     for outlet_name, keys in CHANNELS.items():
         if outlet_name in EXCLUDED_OUTLETS:
             continue
         for key_type, key_value, channel_type in keys:
-            budget = CHANNEL_BUDGETS.get((outlet_name, channel_type))
-            if not budget:
+            if (outlet_name, channel_type) not in TARGET_CHANNELS:
                 continue
-            targets.append(
+            left = days_left.get((outlet_name, channel_type), full_span)
+            if left <= 0:
+                continue  # 이미 하한 도달 — 예산을 주지 않는다
+            active.append(
                 {
                     "outlet_name": outlet_name,
                     "key_type": key_type,
                     "key_value": key_value,
                     "channel_type": channel_type,
-                    "budget": budget,
+                    "days_left": left,
+                    "need": max(MIN_CHANNEL_BUDGET, left * UNITS_PER_DAY),
                 }
             )
-    return targets
+
+    if not active:
+        return []
+
+    # 1) 최소 예산을 모두에게 깔고, 2) 남은 것을 필요량이 적은 순서로 채운다.
+    base = min(MIN_CHANNEL_BUDGET, total_budget // len(active))
+    for t in active:
+        t["budget"] = base
+    remaining = total_budget - base * len(active)
+    for t in sorted(active, key=lambda x: x["need"]):
+        if remaining <= 0:
+            break
+        top_up = min(t["need"] - t["budget"], remaining)
+        if top_up > 0:
+            t["budget"] += top_up
+            remaining -= top_up
+
+    return active
 
 
 def backfill_channel(api_key, db_pool, target):
@@ -369,8 +414,19 @@ def main():
     targets = resolve_targets(conn)
     db_pool.putconn(conn)
 
+    if not targets:
+        print(f"모든 대상 채널이 하한 {RETENTION_FLOOR}에 도달했습니다. 소급할 것이 없습니다.")
+        db_pool.closeall()
+        return
+
     total_budget = sum(t["budget"] for t in targets)
-    print(f"대상 채널 {len(targets)}개 (오마이TV 제외), 총 예산 {total_budget:,} unit, 동시 {CHANNEL_WORKERS}개 처리\n")
+    print(f"대상 채널 {len(targets)}개 (하한 도달·제외 채널 빼고), 총 예산 {total_budget:,} unit,"
+          f" 동시 {CHANNEL_WORKERS}개 처리")
+    print(f"  {'채널':<22}{'남은일':>7}{'배정':>8}")
+    for t in sorted(targets, key=lambda x: x["days_left"]):
+        print(f"  {t['outlet_name'] + '/' + t['channel_type']:<22}"
+              f"{t['days_left']:>7}{t['budget']:>8}")
+    print()
 
     results = []
     with ThreadPoolExecutor(max_workers=CHANNEL_WORKERS) as ex:

@@ -15,9 +15,9 @@ from googleapiclient.errors import HttpError
 from psycopg2.pool import ThreadedConnectionPool
 
 from db import ensure_test_database
-from keywords import load_political_keywords
+from keywords import load_keyword_groups, normalize
 
-POLITICAL_KEYWORDS, FOREIGN_LEADER_EXCLUDE = load_political_keywords()
+DOMESTIC_KEYWORDS, GENERIC_KEYWORDS, FOREIGN_LEADER_EXCLUDE = load_keyword_groups()
 
 # 수집 재개 지점(cutoff)은 "고정된 24시간"이 아니라 **채널별로 DB에 저장된 가장 최신 영상의
 # published_at**을 기준으로 계산한다. 이렇게 하면 실행이 며칠 밀리거나 한 번 건너뛰어도
@@ -147,12 +147,29 @@ def fetch_video_categories(youtube, video_ids):
 
 
 def is_political_title(title):
-    """제목에 해외 정상 이름이 있으면 무조건 비정치 처리(트럼프 등 국제정치 오탐 방지),
-    그 외엔 정치 키워드(정당명/기구·용어/한자 축약/정치인 이름) 중 하나라도 포함되면 정치로 판단.
-    실제 데이터(category=25, 1047건)로 검증: 매치율 12.7%, 해외 정상 오탐 없음."""
+    """제목이 국내 정당정치를 다루는지 판단한다.
+
+    판정 순서:
+      1. 국내 고유 키워드(정당·별칭·한자 축약·정치인 이름)가 있으면 **정치**.
+         해외 정상 이름이 같이 나와도 무시한다.
+      2. 없고 일반 용어(대통령·선거·국회 등)만 있는데 해외 정상 이름이 있으면 **비정치**.
+      3. 그 외 일반 용어가 있으면 정치.
+
+    왜 1번이 필요한가 — 이전 버전은 해외 정상 이름이 있으면 **무조건** 비정치로 처리했다.
+    그 결과 정상외교·국내 시사 프로그램이 통째로 탈락했다(실측 57건 중 23건이 명백한 국내
+    정치): `공항 마중 정청래 '90도 폴더인사'…트럼프의 이란 빅딜 후폭풍`,
+    `트럼프 대통령에 국방비 먼저 꺼낸 이재명`, `잼프의 김혜경 여사 소개에 트럼프 반응은`.
+    반대로 `트럼프 부정선거 관련 대국민 연설`처럼 일반 용어만 걸린 순수 해외 뉴스(34건)는
+    계속 제외되어야 하므로, 키워드를 두 갈래로 나눠 구분한다.
+
+    제목은 비교 전에 NFC 정규화한다(호환용 한자 `李` U+F9E1 문제 — keywords.normalize 참고).
+    """
+    title = normalize(title)
+    if any(kw in title for kw in DOMESTIC_KEYWORDS):
+        return True
     if any(fl in title for fl in FOREIGN_LEADER_EXCLUDE):
         return False
-    return any(kw in title for kw in POLITICAL_KEYWORDS)
+    return any(kw in title for kw in GENERIC_KEYWORDS)
 
 
 def apply_filters(recent_items, categories):

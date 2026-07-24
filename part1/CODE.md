@@ -37,12 +37,18 @@ YouTube Data API                    Neon PostgreSQL
 2차 필터가 쓰는 키워드를 코드와 분리해 데이터로 관리(정치인·정당명은 시간이 지나면 낡아지므로 갱신이 잦음).
 
 - 카테고리: `parties`(정당명) / `institutions_terms`(기구·용어) / `hanja_abbreviations`(한자 축약 與野檢李尹) / `nicknames`(별칭 잼통·잼프) / `politician_names`(정치인) + `exclude_foreign_leaders`(해외 정상 제외 목록)
-- 현재 포함 222개 / 제외 10개, 매치율 67.6%
+- **판정에서 카테고리가 두 갈래로 쓰인다** — `parties`·`hanja_abbreviations`·`nicknames`·`politician_names`(143개)는 **국내 고유**, `institutions_terms`(79개)는 **일반 용어**. 아래 `keywords.py` 참고
+- 현재 포함 222개 / 제외 10개
 - `_comment` 필드에 **오탐으로 확인돼 의도적으로 뺀 키워드**를 기록해둠(검찰·제헌절·정당·당원·군수·시의원·정부·민심·여야) — 나중에 "이거 왜 없지?" 하고 다시 넣는 실수를 막기 위함
 
 ### `keywords.py` — 키워드 로더
-`load_political_keywords()` 하나만 제공. `keywords.json`을 읽어 `(포함 키워드 리스트, 제외 키워드 리스트)` 반환.
-카테고리 구분은 사람이 보기 편하라고 JSON에만 유지하고, 매칭은 구분 없이 "하나라도 포함되면 정치"로 처리.
+- `load_keyword_groups()` → `(국내 고유, 일반 용어, 제외)` **세 갈래**. 판정 로직이 쓰는 것.
+- `load_political_keywords()` → `(포함, 제외)` 2-튜플. 기존 호출부 호환용.
+- `normalize()` → **NFC 정규화**. 제목과 키워드 **양쪽에** 적용해야 한다(한쪽만 하면 여전히 안 맞음).
+
+> **왜 세 갈래인가** (2026-07-24). 이전에는 카테고리 구분 없이 "하나라도 포함되면 정치"로 합쳐 쓰고, 해외 정상 이름이 있으면 **무조건** 제외했다. 그래서 `트럼프 대통령에 국방비 먼저 꺼낸 이재명` 같은 정상외교·국내 시사물이 통째로 탈락했다(실측 57건 중 23건이 국내 정치). 국내 고유 키워드(정당·별칭·한자 축약·인물, 143개)가 걸리면 제외를 무시하고, 일반 용어(기구·용어, 79개)만 걸렸을 때만 제외한다.
+>
+> **왜 정규화가 필요한가.** 헤드라인의 `李`가 표준 한자(U+674E)가 아니라 **CJK 호환용 한자(U+F9E1)**로 들어오는 경우가 있다. 눈에는 같지만 `in`이 False를 낸다. 실측 413개 제목에 호환용 한자가 있었고 7건이 이 때문에 누락돼 있었다.
 
 ### `db.py` — 테스트 DB 관리
 `ensure_test_database()`: 운영 `DATABASE_URL`과 같은 Neon 프로젝트 안에 테스트 전용 DB(`collect_test`)를 만들고 마이그레이션까지 적용한 뒤 그 DB의 연결 문자열을 반환. **운영 DB 테이블은 건드리지 않음.**
@@ -62,11 +68,13 @@ YouTube Data API                    Neon PostgreSQL
 ### `backfill.py` — 과거 영상 소급 수집
 매일 24시간치만 모으는 `collect.py`와 달리 **더 과거로** 소급 수집하는 도구. 상시 실행하지 않고, 하루 남은 쿼터에 맞춰 수동으로 돌린다.
 
-- **`CHANNEL_BUDGETS`(채널별 독립 quota) + `MAX_PAGES_PER_CHANNEL`(채널당 페이지 상한)** 이중 안전장치 — 전체 공용 예산 하나만 뒀다가 한 채널(오마이TV)이 예산을 독점해버린 사고가 있어서 이렇게 바꿈. `EXCLUDED_OUTLETS`는 이미 충분히 모인 채널을 제외
+- **채널별 독립 quota + `MAX_PAGES_PER_CHANNEL`(채널당 페이지 상한)** 이중 안전장치 — 전체 공용 예산 하나만 뒀다가 한 채널(오마이TV)이 예산을 독점해버린 사고가 있어서 이렇게 바꿈
+- **예산은 `resolve_targets()`가 실행할 때마다 자동 배분한다**(2026-07-24). `channels.backfill_cursor`로 채널별 남은 일수를 읽어 ①하한 도달 채널은 제외 ②`MIN_CHANNEL_BUDGET`을 깔고 ③남은 예산을 **필요량이 적은 채널부터** 채운다. 손으로 적던 `CHANNEL_BUDGETS` 상수는 완주 채널의 몫이 놀아서(실측 1,758 unit) 폐기했다. '가까운 채널부터'인 이유는 `playlistItems`가 날짜 점프를 못 해 **매 실행마다 커서까지 다시 페이지를 넘겨야** 하고, 채널을 빨리 끝낼수록 그 반복 비용이 사라지기 때문 (시뮬레이션: 완주까지 2일 vs 균등 배분 3일)
+- `TOTAL_BUDGET`(7,920)만 조정하면 되고, `EXCLUDED_OUTLETS`는 이미 충분히 모인 채널을 제외
 - 재개 지점은 `channels.backfill_cursor`(실제로 훑은 가장 오래된 지점). `MIN(published_at)`을 쓰면 정치 영상이 없는 구간을 훑고도 커서가 안 움직여 매일 같은 구간을 다시 훑게 됨
 - 하한선은 `prune.RETENTION_FLOOR`를 **import해서 공유**한다. 두 곳에 따로 적으면 backfill이 긁어온 구간을 prune이 곧바로 지우는 일이 생김
 - 채널 조회 시 `outlet_name`이 아니라 **`CHANNELS`에서 얻은 `channel_id`로 직접 조회** — outlet_name이 DB에서 유일하지 않아 엉뚱한 채널을 긁은 사고가 있었음
-- 다시 쓸 땐 `CHANNEL_BUDGETS`를 그날 남은 실제 쿼터에 맞춰 조정할 것
+- 다시 쓸 땐 `TOTAL_BUDGET`을 그날 남은 실제 쿼터에 맞춰 조정할 것 (채널별 배분은 자동)
 
 ### `prune.py` — 하한선보다 오래된 데이터 삭제
 `RETENTION_FLOOR`(고정 날짜)를 정의하는 **유일한 곳**이고 `backfill.py`가 이 값을 가져다 쓴다.
@@ -101,7 +109,7 @@ pip install -r requirements.txt
 
 python migrate.py     # 스키마 생성/갱신 (주의: 운영 DB 대상)
 python collect.py     # 24시간치 수집 (테스트 DB에 적재)
-python backfill.py    # 과거 소급 수집 (필요할 때만, CHANNEL_BUDGETS 조정 후)
+python backfill.py    # 과거 소급 수집 (필요할 때만, TOTAL_BUDGET 확인 후)
 python prune.py --dry-run    # 하한선보다 오래된 데이터 확인 (--yes로 실제 삭제)
 ```
 
