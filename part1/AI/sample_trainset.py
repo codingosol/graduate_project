@@ -19,11 +19,18 @@ from collections import Counter, defaultdict
 import psycopg2
 from dotenv import load_dotenv
 
+# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 from db import ensure_test_database
 
 MIN_TEXT_LEN = 10    # labeling_tool/label.py와 같은 값
 MAX_TEXT_LEN = 600
-OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "labeling_tool", "trainset")
+# labeling_tool/은 저장소 루트(part1의 부모) 아래에 있다. AI/에서 두 단계 위로 올라간다.
+DEFAULT_OUT_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "..", "labeling_tool", "trainset"
+)
 
 
 def _h(salt, s):
@@ -66,7 +73,9 @@ def main():
     p.add_argument("--run", default="llm_train_v1")
     p.add_argument("--size", type=int, default=700)
     p.add_argument("--chunk", type=int, default=100, help="청크 파일당 댓글 수")
+    p.add_argument("--out", default=DEFAULT_OUT_DIR, help="청크 JSON을 내보낼 디렉토리")
     args = p.parse_args()
+    out_dir = args.out
 
     load_dotenv()
     database_url = os.environ.get("DATABASE_URL")
@@ -134,7 +143,7 @@ def main():
     if worst > 2:
         raise SystemExit("중단: 청크별 채널 구성이 고르지 않습니다. interleave()를 확인하세요.")
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     index = {}
     n_chunks = 0
     for i in range(0, len(chosen), args.chunk):
@@ -144,14 +153,14 @@ def main():
         for j, (comment_id, text) in enumerate(part, start=i):
             index[j] = comment_id
             rows.append({"n": j, "text": text})
-        path = os.path.join(OUT_DIR, f"chunk_{n_chunks:02d}.json")
+        path = os.path.join(out_dir, f"chunk_{n_chunks:02d}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False, indent=1)
 
-    with open(os.path.join(OUT_DIR, "index.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as f:
         json.dump({"run": args.run, "index": index}, f, ensure_ascii=False, indent=1)
 
-    print(f"\n표본 {len(chosen)}건 → 청크 {n_chunks}개 ({OUT_DIR})")
+    print(f"\n표본 {len(chosen)}건 → 청크 {n_chunks}개 ({out_dir})")
     print(f"run_id: {args.run}")
     conn.close()
 

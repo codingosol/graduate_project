@@ -43,6 +43,10 @@ import torch.nn.functional as F
 from dotenv import load_dotenv
 from torch.utils.data import DataLoader, TensorDataset
 
+# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 from db import ensure_test_database
 
 MODEL_NAME = "beomi/KcELECTRA-base-v2022"
@@ -197,6 +201,23 @@ def train_model(train_rows, tokenizer, args, device, quiet=False):
     return model
 
 
+def macro_f1(y_true, y_pred):
+    """클래스별 F1의 평균. dev셋에서 하이퍼파라미터를 고를 때 쓰는 조용한 점수 함수.
+
+    정확도가 아니라 macro-F1으로 고르는 이유: 드문 클래스(불가)를 통째로 놓쳐도 정확도는
+    멀쩡할 수 있어, 정확도로 고르면 '불가를 포기한' 설정이 뽑힌다. macro-F1은 클래스를
+    개수와 무관하게 똑같이 취급해 그런 설정에 벌점을 준다.
+    """
+    f1s = []
+    for i in range(len(LABELS)):
+        tp = int(((y_pred == i) & (y_true == i)).sum())
+        pp, ap = int((y_pred == i).sum()), int((y_true == i).sum())
+        pr = tp / pp if pp else 0.0
+        rc = tp / ap if ap else 0.0
+        f1s.append(2 * pr * rc / (pr + rc) if pr + rc else 0.0)
+    return float(np.mean(f1s))
+
+
 def report(y_true, y_pred, channels):
     """채점 결과를 사람이 읽을 수 있게 출력한다."""
     n = len(y_true)
@@ -253,6 +274,71 @@ def report(y_true, y_pred, channels):
     return acc, float(np.mean(f1s))
 
 
+def tune_and_evaluate(train_rows, eval_loader, y_true, channels, tokenizer, args, device):
+    """dev셋으로 하이퍼파라미터를 고른 뒤 평가셋을 딱 한 번 측정한다.
+
+    왜 필요한가 — 지금까지 epochs 15와 class-weights를 **평가셋 점수를 보고** 골랐다.
+    이는 시험지를 미리 보고 공부법을 정한 것이라, 그 평가셋 점수가 실제 실력보다 부풀려진다
+    (평가셋 과적합). 학습셋에서 dev를 떼어 거기서 고르면 평가셋은 선택에 전혀 관여하지 않아,
+    최종 점수가 정직해진다.
+
+    절차:
+      1. 학습셋을 train_sub + dev(기본 100)로 나눈다.
+      2. epochs × class-weights 그리드를 train_sub로 학습, dev로 macro-F1 평가.
+      3. dev가 고른 최선 설정으로 **전체 학습셋**을 재학습(dev를 다시 합쳐 데이터 최대 활용).
+      4. 그 모델을 평가셋으로 1회 측정 → 보고서에 쓸 정직한 수치.
+
+    학습셋 700에서 dev 100을 떼면 train_sub가 600으로 준다. 학습곡선상 500건에서 이미
+    포화이므로(DECISIONS 07-23 (3)) 600으로도 탐색 성능은 거의 안 떨어진다.
+    """
+    set_seed(args.seed)
+    pool = train_rows[:]
+    random.shuffle(pool)
+    dev = pool[: args.dev_size]
+    sub = pool[args.dev_size :]
+
+    dev_loader = make_loader(tokenizer, dev, args.batch, shuffle=False)
+    y_dev = np.array([r[1] for r in dev])
+
+    grid = [(e, cw) for e in (8, 15, 25) for cw in (False, True)]
+    print(f"\n{'='*66}")
+    print(f"=== dev셋으로 하이퍼파라미터 탐색 (train {len(sub)} / dev {len(dev)}) ===")
+    print(f"  ※ 평가셋 {len(y_true)}건은 선택에 관여하지 않고 맨 마지막에 1회만 쓴다.\n")
+
+    scored = []
+    for e, cw in grid:
+        set_seed(args.seed)
+        run_args = argparse.Namespace(**vars(args))
+        run_args.epochs, run_args.class_weights = e, cw
+        model = train_model(sub, tokenizer, run_args, device, quiet=True)
+        f1 = macro_f1(y_dev, predict(model, dev_loader, device))
+        scored.append((f1, e, cw))
+        print(f"  epochs {e:>2}  class-weights {str(cw):<5}  →  dev macro-F1 {f1*100:.1f}%")
+        del model
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    scored.sort(reverse=True)
+    best_f1, best_e, best_cw = scored[0]
+    print(f"\n  → dev가 고른 최선: epochs {best_e}, class-weights {best_cw} "
+          f"(dev macro-F1 {best_f1*100:.1f}%)")
+
+    print(f"\n{'='*66}")
+    print(f"=== 최선 설정으로 전체 {len(train_rows)}건 재학습 → 평가셋 최종 측정 (1회) ===")
+    set_seed(args.seed)
+    run_args = argparse.Namespace(**vars(args))
+    run_args.epochs, run_args.class_weights = best_e, best_cw
+    model = train_model(train_rows, tokenizer, run_args, device, quiet=True)
+    report(y_true, predict(model, eval_loader, device), channels)
+    print("\n  ※ 위 평가셋 수치는 dev로 고른 설정을 한 번만 적용한 것이라 보고서에 쓸 수 있다.")
+
+    if args.save:
+        os.makedirs(args.save, exist_ok=True)
+        model.save_pretrained(args.save)
+        tokenizer.save_pretrained(args.save)
+        print(f"\n모델 저장: {args.save} (epochs {best_e}, class-weights {best_cw})")
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description="댓글 성향 분류기 학습")
@@ -266,6 +352,9 @@ def main():
                    help="드문 클래스(불가 40건)에 가중치를 줘 균형을 맞춘다")
     p.add_argument("--curve", action="store_true",
                    help="100/250/500/전체로 각각 학습해 학습곡선을 낸다 (스텝 수 고정)")
+    p.add_argument("--tune", action="store_true",
+                   help="학습셋에서 dev 100건을 떼어 하이퍼파라미터를 고른 뒤 평가셋을 1회만 측정한다")
+    p.add_argument("--dev-size", type=int, default=100, help="--tune 시 dev로 뗄 개수")
     p.add_argument("--save", metavar="DIR", help="학습된 모델을 저장할 경로")
     args = p.parse_args()
 
@@ -295,6 +384,10 @@ def main():
     eval_loader = make_loader(tokenizer, eval_rows, args.batch, shuffle=False)
     y_true = np.array([r[1] for r in eval_rows])
     channels = [r[2] for r in eval_rows]
+
+    if args.tune:
+        tune_and_evaluate(train_rows, eval_loader, y_true, channels, tokenizer, args, device)
+        return
 
     sizes = [100, 250, 500, len(train_rows)] if args.curve else [len(train_rows)]
 

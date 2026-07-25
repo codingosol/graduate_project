@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import json
 import os
@@ -13,6 +14,10 @@ from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from psycopg2.pool import ThreadedConnectionPool
+
+# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 from db import ensure_test_database
 from keywords import load_keyword_groups, normalize
@@ -428,6 +433,18 @@ def process_video(api_key, db_pool, channel_id, item, category_id, category_name
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
+    p = argparse.ArgumentParser(description="일일 정치뉴스 댓글 수집")
+    p.add_argument("--window-hours", type=int, default=24,
+                   help="정치 영상이 아직 없는 신규 채널의 fallback 수집 창 (기본 24)")
+    p.add_argument("--max-lookback-days", type=int, default=7,
+                   help="watermark 재개 구간 상한. 실행이 오래 밀렸을 때 넓게 잡으려면 키운다 (기본 7)")
+    args = p.parse_args()
+
+    # 모듈 상수를 CLI로 덮어쓴다. get_cutoff 등 여러 함수가 전역으로 참조하므로 여기서 재바인딩한다.
+    global DEFAULT_WINDOW, MAX_LOOKBACK
+    DEFAULT_WINDOW = timedelta(hours=args.window_hours)
+    MAX_LOOKBACK = timedelta(days=args.max_lookback_days)
+
     load_dotenv()
     start_time = time.perf_counter()
 

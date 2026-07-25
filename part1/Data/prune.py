@@ -26,6 +26,10 @@ import sys
 import psycopg2
 from dotenv import load_dotenv
 
+# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 from db import ensure_test_database
 
 # 수집 하한선. 이 시각보다 이전에 업로드된 영상은 보관하지 않는다.

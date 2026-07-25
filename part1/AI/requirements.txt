@@ -1,0 +1,20 @@
+# AI 학습·추론 전용 의존성 — 로컬 GPU에서만 설치한다.
+# GitHub Actions(수집)는 이 파일을 쓰지 않는다. CI는 ../requirements.txt만 설치한다
+# (torch 2.8GB를 매 실행 설치하지 않도록, 그리고 러너엔 GPU가 없어 학습을 돌리지 않으므로).
+#
+# 설치:  pip install -r AI/requirements.txt   (part1/ 에서)
+
+# DB 접근(공용 db.py)·dotenv 등 수집 쪽과 겹치는 의존성을 그대로 상속한다.
+-r ../requirements.txt
+
+# torch cu128(CUDA 12.8) 빌드는 일반 PyPI에 없어 전용 인덱스가 필요하다.
+# 실측 환경: RTX 4050 Laptop(Ada, sm_89) + Python 3.12. 다른 CUDA/CPU 환경이면
+# https://pytorch.org 에서 맞는 설치 명령을 확인해 torch 줄을 교체할 것.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+
+# transformers가 tokenizers·safetensors·huggingface-hub를 의존성으로 함께 끌어온다.
+transformers==4.52.4
+
+# torch/transformers가 numpy를 끌어오지만, 재현성을 위해 실측 버전으로 고정한다.
+numpy==1.26.4

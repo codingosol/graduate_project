@@ -16,15 +16,23 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
+# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 from db import ensure_test_database
 
-DIR = os.path.join(os.path.dirname(__file__), "..", "labeling_tool", "trainset")
+# labeling_tool/은 저장소 루트(part1의 부모) 아래에 있다. AI/에서 두 단계 위로 올라간다.
+DEFAULT_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "..", "labeling_tool", "trainset"
+)
 
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description="LLM 학습셋 라벨 적재")
     p.add_argument("--run", default="llm_train_v1")
+    p.add_argument("--dir", default=DEFAULT_DIR, help="chunk/labels/index.json이 있는 디렉토리")
     args = p.parse_args()
 
     load_dotenv()
@@ -32,11 +40,11 @@ def main():
     if not database_url:
         raise SystemExit("DATABASE_URL 환경변수가 필요합니다.")
 
-    with open(os.path.join(DIR, "index.json"), encoding="utf-8") as f:
+    with open(os.path.join(args.dir, "index.json"), encoding="utf-8") as f:
         index = json.load(f)["index"]
 
     labels = {}
-    files = sorted(glob.glob(os.path.join(DIR, "labels_*.json")))
+    files = sorted(glob.glob(os.path.join(args.dir, "labels_*.json")))
     for path in files:
         with open(path, encoding="utf-8") as f:
             labels.update(json.load(f))

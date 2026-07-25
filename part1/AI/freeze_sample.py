@@ -38,6 +38,10 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
+# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 from db import ensure_test_database
 
 MIN_TEXT_LEN = 10   # labeling_tool/label.py와 같은 값이어야 한다

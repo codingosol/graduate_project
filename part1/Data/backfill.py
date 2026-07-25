@@ -12,6 +12,7 @@
      각 채널이 독립 예산을 쓰므로 스레드 간 공유 상태가 없어 경쟁 조건도 없다.
 """
 
+import argparse
 import os
 import sys
 import threading
@@ -23,6 +24,10 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 from psycopg2.pool import ThreadedConnectionPool
+
+# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 from collect import (
     CHANNELS,
@@ -77,9 +82,15 @@ EXCLUDED_OUTLETS = {"오마이TV"}  # 프루닝 후에도 4,054편으로 다른 
 # 채널별로 58~98로 갈리므로(영상 밀도 차이) 여유를 둬 90으로 잡는다.
 UNITS_PER_DAY = 90
 
-# 채널당 최소 예산. playlistItems는 날짜로 점프할 수 없어 **매 실행마다 1페이지부터 다시 넘겨**
-# 커서 위치까지 도달해야 한다. 커서가 깊을수록 이 통과 비용만 100 unit을 넘으므로,
-# 이보다 적게 주면 커서에 닿기도 전에 예산이 끝나 아무 진전이 없다.
+# **커서 통과 비용** — 매 실행마다 최신 영상부터 커서까지 페이지를 다시 넘기는 데 드는 quota/일.
+# playlistItems가 날짜 점프를 못 해, 커서가 오래됐을수록(now에서 멀수록) 통과에만 많이 쓴다.
+# 소급(UNITS_PER_DAY)과 달리 카테고리·댓글 조회가 없어 페이지 비용만이라 훨씬 작다.
+# 실측 근거: YTN이 커서 약 92일 전인 상태에서 300 unit으로 커서에 닿지도 못했다(300/92≈3.3).
+# 여유를 둬 5로 잡는다. 채널별 업로드 밀도 차이는 무시한 근사지만, "커서 깊은 채널에 더 준다"는
+# 방향만 맞으면 되고 남은 오차는 다음 실행에서 커서가 갱신되며 자동 보정된다.
+PASS_UNITS_PER_DAY = 5
+
+# 채널당 최소 예산(하한). 이제 통과 비용이 need에 반영되므로 이 값은 안전망 역할만 한다.
 MIN_CHANNEL_BUDGET = 300
 
 
@@ -138,14 +149,16 @@ def resolve_targets(conn, total_budget=TOTAL_BUDGET):
     cur.execute(
         """
         SELECT outlet_name, channel_type,
-               GREATEST((backfill_cursor::date - %s::date), 0) AS days_left
+               GREATEST((backfill_cursor::date - %s::date), 0)  AS days_left,
+               GREATEST((now()::date - backfill_cursor::date), 0) AS days_since_cursor
         FROM channels
         """,
         (RETENTION_FLOOR,),
     )
     # 커서가 없는 채널(아직 한 번도 안 훑음)은 전 구간이 남은 것으로 본다.
     full_span = (datetime.now(timezone.utc).date() - BACKFILL_FLOOR.date()).days
-    days_left = {(o, t): (d if d is not None else full_span) for o, t, d in cur.fetchall()}
+    stats = {(o, t): (dl if dl is not None else full_span, dsc if dsc is not None else 0)
+             for o, t, dl, dsc in cur.fetchall()}
 
     active = []
     for outlet_name, keys in CHANNELS.items():
@@ -154,9 +167,12 @@ def resolve_targets(conn, total_budget=TOTAL_BUDGET):
         for key_type, key_value, channel_type in keys:
             if (outlet_name, channel_type) not in TARGET_CHANNELS:
                 continue
-            left = days_left.get((outlet_name, channel_type), full_span)
+            left, since_cursor = stats.get((outlet_name, channel_type), (full_span, 0))
             if left <= 0:
                 continue  # 이미 하한 도달 — 예산을 주지 않는다
+            # 필요량 = 커서까지 다시 넘기는 통과 비용 + 커서 아래로 더 내려가는 소급 비용.
+            # 통과 비용을 빼먹으면 커서 깊은 채널(YTN)이 최소 예산만 받아 커서에 닿지도 못한다.
+            need = since_cursor * PASS_UNITS_PER_DAY + left * UNITS_PER_DAY
             active.append(
                 {
                     "outlet_name": outlet_name,
@@ -164,7 +180,7 @@ def resolve_targets(conn, total_budget=TOTAL_BUDGET):
                     "key_value": key_value,
                     "channel_type": channel_type,
                     "days_left": left,
-                    "need": max(MIN_CHANNEL_BUDGET, left * UNITS_PER_DAY),
+                    "need": max(MIN_CHANNEL_BUDGET, need),
                 }
             )
 
@@ -388,6 +404,13 @@ def backfill_channel(api_key, db_pool, target):
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
+    parser = argparse.ArgumentParser(description="정치뉴스 영상 과거 소급 수집")
+    parser.add_argument(
+        "--budget", type=int, default=TOTAL_BUDGET,
+        help=f"이번 실행에 쓸 총 quota (기본 {TOTAL_BUDGET}). 그날 남은 쿼터에 맞춰 조절.",
+    )
+    args = parser.parse_args()
+
     load_dotenv()
     start = time.perf_counter()
 
@@ -411,7 +434,7 @@ def main():
             "INSERT INTO outlets (outlet_name) VALUES %s ON CONFLICT DO NOTHING",
             [(name,) for name in CHANNELS],
         )
-    targets = resolve_targets(conn)
+    targets = resolve_targets(conn, args.budget)
     db_pool.putconn(conn)
 
     if not targets:

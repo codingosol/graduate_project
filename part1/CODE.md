@@ -3,6 +3,20 @@
 Part 1(뉴스 채널 정치성향 분석)의 `part1/` 디렉토리에 있는 각 파일의 역할 정리.
 설계 배경과 진행 상황은 [Part1.md](Part1.md), 의사결정 히스토리는 `../DECISIONS.md` 참고.
 
+## 디렉토리 배치
+
+```
+part1/
+├── db.py, migrate.py, DB_migrations/, requirements.txt   ← 공용 (Data·AI 양쪽이 씀)
+├── Data/   collect · backfill · prune · reclassify · keywords(.py/.json)   ← 수집·ETL
+└── AI/     train · sanity_check · freeze_sample · sample_trainset · ingest_trainset · blind_check   ← 학습·라벨링
+```
+
+- **실행은 `part1/`에서** `python Data/collect.py`, `python AI/train.py` 형태.
+- **부트스트랩**: Data/·AI/ 스크립트는 상단에서 `sys.path`에 part1 루트를 추가해 공용 모듈
+  (`db`, `migrate`)을 import한다. 같은 디렉토리끼리(예: `backfill`→`collect`, `sanity_check`→`train`)는
+  파이썬이 실행 스크립트 디렉토리를 자동으로 넣어주므로 부트스트랩 없이 그대로 import된다.
+
 ## 전체 흐름
 
 ```
@@ -12,11 +26,11 @@ YouTube Data API                    Neon PostgreSQL
       │  → videos(카테고리) → 필터         │
       │  → commentThreads                  │
       ▼                                    │
-  collect.py  ──────── 적재 ───────────────┘
+  Data/collect.py  ──── 적재 ──────────────┘
       │                        (현재는 테스트 DB `collect_test`에만 적재)
-      ├── keywords.py / keywords.json  (2차 필터: 정치 키워드 판별)
-      ├── db.py                        (테스트 DB 생성·연결)
-      └── migrate.py / migrations/     (스키마 관리)
+      ├── Data/keywords.py / keywords.json  (2차 필터: 정치 키워드 판별)
+      ├── db.py                             (테스트 DB 생성·연결, 공용)
+      └── migrate.py / DB_migrations/       (스키마 관리, 공용)
 ```
 
 ## 파일별 역할
@@ -53,14 +67,14 @@ YouTube Data API                    Neon PostgreSQL
 ### `db.py` — 테스트 DB 관리
 `ensure_test_database()`: 운영 `DATABASE_URL`과 같은 Neon 프로젝트 안에 테스트 전용 DB(`collect_test`)를 만들고 마이그레이션까지 적용한 뒤 그 DB의 연결 문자열을 반환. **운영 DB 테이블은 건드리지 않음.**
 
-### `migrate.py` + `migrations/` — 스키마 마이그레이션
-- `migrations/0001_init.sql`: outlets / channels / videos / comments 테이블 + 인덱스
-- `migrations/0002_slim_raw.sql`: `raw JSONB` 제거 + 필요 필드(`author_channel_id`, `total_reply_count`) 추출, `text`를 textOriginal로 교체. **UPDATE 대신 새 테이블로 교체하는 방식** — 제자리 UPDATE는 22만 행 재작성에 용량이 2배 필요해 Neon 512MB 한도에 걸렸었음
-- `migrations/0003_channel_type.sql`: `channels.channel_type`(news/opinion) 추가 — 스트레이트 뉴스와 시사/논평 채널을 구분해 장르 효과를 분리하기 위함
-- `migrations/0004_comment_labels.sql`: 성향 라벨을 `comments` 컬럼에서 떼어내 `label_runs` + `comment_labels`로 분리. UPDATE로 인한 MVCC 용량 폭증 회피가 주목적이고, `run_id`로 라벨링 세대를 나란히 보관해 손라벨 정답셋이 덮이지 않게 함
-- `migrations/0005_drop_label_comment_index.sql`: 0004에서 넣은 `idx_comment_labels_comment` 제거 — 79.9만 행 실측에서 플래너가 한 번도 쓰지 않으면서 33MB만 차지했음
-- `migrations/0006_label_unusable.sql`: 라벨 값에 `unusable` 추가 — `neutral`(정치적이나 편향 없음)과 판단 대상이 아닌 잡음("ㅋㅋㅋ", "1등", 광고)을 구분. 뭉치면 모델이 "노이즈=중립"을 학습해 채널 점수가 0쪽으로 끌린다
-- `migrations/0007_label_sample.sql`: 평가셋 표본을 고정하는 `label_sample` 테이블. `comments`를 **`ON DELETE RESTRICT`로** 참조한다(`comment_labels`의 CASCADE와 반대) — 표본이 삭제되면 실험이 무효가 되므로 전파시키지 않고 아예 막는다
+### `migrate.py` + `DB_migrations/` — 스키마 마이그레이션
+- `DB_migrations/0001_init.sql`: outlets / channels / videos / comments 테이블 + 인덱스
+- `DB_migrations/0002_slim_raw.sql`: `raw JSONB` 제거 + 필요 필드(`author_channel_id`, `total_reply_count`) 추출, `text`를 textOriginal로 교체. **UPDATE 대신 새 테이블로 교체하는 방식** — 제자리 UPDATE는 22만 행 재작성에 용량이 2배 필요해 Neon 512MB 한도에 걸렸었음
+- `DB_migrations/0003_channel_type.sql`: `channels.channel_type`(news/opinion) 추가 — 스트레이트 뉴스와 시사/논평 채널을 구분해 장르 효과를 분리하기 위함
+- `DB_migrations/0004_comment_labels.sql`: 성향 라벨을 `comments` 컬럼에서 떼어내 `label_runs` + `comment_labels`로 분리. UPDATE로 인한 MVCC 용량 폭증 회피가 주목적이고, `run_id`로 라벨링 세대를 나란히 보관해 손라벨 정답셋이 덮이지 않게 함
+- `DB_migrations/0005_drop_label_comment_index.sql`: 0004에서 넣은 `idx_comment_labels_comment` 제거 — 79.9만 행 실측에서 플래너가 한 번도 쓰지 않으면서 33MB만 차지했음
+- `DB_migrations/0006_label_unusable.sql`: 라벨 값에 `unusable` 추가 — `neutral`(정치적이나 편향 없음)과 판단 대상이 아닌 잡음("ㅋㅋㅋ", "1등", 광고)을 구분. 뭉치면 모델이 "노이즈=중립"을 학습해 채널 점수가 0쪽으로 끌린다
+- `DB_migrations/0007_label_sample.sql`: 평가셋 표본을 고정하는 `label_sample` 테이블. `comments`를 **`ON DELETE RESTRICT`로** 참조한다(`comment_labels`의 CASCADE와 반대) — 표본이 삭제되면 실험이 무효가 되므로 전파시키지 않고 아예 막는다
 - `migrate.py`: 아직 적용 안 된 `.sql` 파일만 순서대로 실행하고 `schema_migrations` 테이블에 이력 기록
 - **스키마를 바꿀 땐 기존 파일을 수정하지 말고 `0002_xxx.sql` 같은 새 파일을 추가할 것** (기존 파일 수정 시 이미 적용된 DB와 어긋남)
 - 실행: `python migrate.py` — **주의: 이건 `DATABASE_URL`(운영 DB) 대상임.** 테스트 DB에 적용하려면 `db.ensure_test_database()`를 쓰거나 test URL로 `apply_migrations()`를 직접 호출할 것
@@ -70,6 +84,7 @@ YouTube Data API                    Neon PostgreSQL
 
 - **채널별 독립 quota + `MAX_PAGES_PER_CHANNEL`(채널당 페이지 상한)** 이중 안전장치 — 전체 공용 예산 하나만 뒀다가 한 채널(오마이TV)이 예산을 독점해버린 사고가 있어서 이렇게 바꿈
 - **예산은 `resolve_targets()`가 실행할 때마다 자동 배분한다**(2026-07-24). `channels.backfill_cursor`로 채널별 남은 일수를 읽어 ①하한 도달 채널은 제외 ②`MIN_CHANNEL_BUDGET`을 깔고 ③남은 예산을 **필요량이 적은 채널부터** 채운다. 손으로 적던 `CHANNEL_BUDGETS` 상수는 완주 채널의 몫이 놀아서(실측 1,758 unit) 폐기했다. '가까운 채널부터'인 이유는 `playlistItems`가 날짜 점프를 못 해 **매 실행마다 커서까지 다시 페이지를 넘겨야** 하고, 채널을 빨리 끝낼수록 그 반복 비용이 사라지기 때문 (시뮬레이션: 완주까지 2일 vs 균등 배분 3일)
+- **필요량(`need`)은 통과 비용 + 소급 비용**이다(2026-07-25). 커서까지 다시 넘기는 `days_since_cursor × PASS_UNITS_PER_DAY`와 커서 아래로 내려가는 `days_left × UNITS_PER_DAY`의 합. 통과 비용을 빼먹으면 커서 깊은 채널(YTN, 커서 92일 전)이 남은 일수가 적다는 이유로 최소 예산만 받아 **커서에 닿지도 못하고 끝난다**(실측: 300 unit으로 훑음 0건).
 - `TOTAL_BUDGET`(7,920)만 조정하면 되고, `EXCLUDED_OUTLETS`는 이미 충분히 모인 채널을 제외
 - 재개 지점은 `channels.backfill_cursor`(실제로 훑은 가장 오래된 지점). `MIN(published_at)`을 쓰면 정치 영상이 없는 구간을 훑고도 커서가 안 움직여 매일 같은 구간을 다시 훑게 됨
 - 하한선은 `prune.RETENTION_FLOOR`를 **import해서 공유**한다. 두 곳에 따로 적으면 backfill이 긁어온 구간을 prune이 곧바로 지우는 일이 생김
@@ -86,17 +101,33 @@ YouTube Data API                    Neon PostgreSQL
 ### `reclassify.py` — 기존 영상의 정치 여부 재판정
 `keywords.json`을 고친 뒤 이미 저장된 영상의 `is_political`을 다시 계산한다. 키워드는 정치인·정당명이 섞여 있어 시간이 지나면 낡으므로 주기적으로 갱신 → 재판정이 필요하다.
 
-### 라벨링 지원 스크립트
+## AI/ — 학습·라벨링
+
+### `train.py` — 성향 분류기 학습
+`beomi/KcELECTRA-base-v2022` 파인튜닝. 학습 700건(`llm_train_v1`) / 평가 150건(`manual_gold_v1`).
+
+- **평가셋 오염 차단이 SQL에 박혀 있다** — `run_id='manual_gold_v1'`인 라벨 전부(잉여분 포함)를 학습에서 제외한다. `label_sample` 150건만 빼면 잉여 라벨이 2차분 표본으로 편입될 때 오염된다.
+- `--curve`(100/250/500/700 학습곡선, **스텝 수 고정**), `--labels human-first`(맹검 100건을 사람 라벨로 교체), `--class-weights`(드문 클래스 보정), `--save DIR`(모델 저장).
+- **epoch을 너무 작게 두면 학습이 안 된다** — 700÷32=22스텝/epoch이라 4 epoch(88스텝)은 부족해 `좌`·`불가`를 아예 예측 못 한다. 기본 15 epoch(330스텝).
+
+### `sanity_check.py` — 순열 검정
+"예측 분포가 학습셋 분포를 따라 찍는 것 아닌가"를 가른다. **라벨을 무작위로 섞어** 텍스트-정답 관계를 끊은 대조군과 비교(정상 74.7% vs 셔플 38.7%, z=9.1). 라벨·입력을 바꿀 때마다 재실행해 "진짜 학습인지"를 확인한다. `train.py`의 함수를 import한다.
+
+### 라벨링 파이프라인
 
 | 파일 | 역할 |
 |---|---|
 | `freeze_sample.py` | 평가셋 표본을 `label_sample`에 **못박는다**(`ord` 순서까지). 라벨링 툴은 읽기만 한다 — 매번 새로 뽑던 방식은 수집이 진행될 때마다 표본이 바뀌어 라벨이 특정 채널에 쏠리는 사고를 냈다 |
-| `sample_trainset.py` | 학습셋 표본을 뽑아 청크 JSON으로 내보낸다. 평가셋·기존 라벨과 겹치지 않게 제외하고, **영상 제목은 내보내지 않는다**(라벨을 매기는 쪽이 모델보다 많은 정보를 보면 안 되므로). 채널이 청크마다 고르게 섞이도록 라운드로빈 배치하고, 내보내기 전에 편차를 검사해 어긋나면 중단 |
-| `ingest_trainset.py` | 채워진 라벨 JSON을 `comment_labels`에 UPSERT. 평가셋과 겹침 0건을 확인 |
+| `sample_trainset.py` | 학습셋 표본을 뽑아 청크 JSON으로 내보낸다(`--out`). 평가셋·기존 라벨과 겹치지 않게 제외하고, **영상 제목은 내보내지 않는다**(라벨을 매기는 쪽이 모델보다 많은 정보를 보면 안 되므로). 채널이 청크마다 고르게 섞이도록 라운드로빈 배치하고, 내보내기 전에 편차를 검사해 어긋나면 중단 |
+| `ingest_trainset.py` | 채워진 라벨 JSON(`--dir`)을 `comment_labels`에 UPSERT. 평가셋과 겹침 0건을 확인 |
 | `blind_check.py` | 학습셋 라벨의 **맹검 일치율** 측정. `prepare`로 새 `run_id` 표본을 만들면 기존 라벨이 조인되지 않아 툴 코드를 고치지 않고 맹검이 성립한다. `compare`로 일치율·Cohen's kappa·혼동행렬 출력 |
 
-### `requirements.txt`
-`google-api-python-client`(YouTube API) / `psycopg2-binary`(PostgreSQL 드라이버) / `python-dotenv`(로컬 `.env` 로드). 병렬 처리는 표준 라이브러리(`concurrent.futures`)만 써서 별도 의존성 없음.
+> `sample_trainset`·`ingest_trainset`이 쓰는 청크 파일은 저장소 루트의 `labeling_tool/trainset/`에
+> 있다(gitignore). AI/에서 두 단계 위(`../../`)라, 기본 경로가 그렇게 잡혀 있고 `--out`/`--dir`로 바꿀 수 있다.
+
+### `requirements.txt` (수집용) / `AI/requirements.txt` (학습용)
+- **`requirements.txt`** — 수집·ETL과 CI가 쓴다. `google-api-python-client` / `psycopg2-binary` / `python-dotenv`. 병렬 처리는 표준 라이브러리(`concurrent.futures`)라 별도 의존성 없음.
+- **`AI/requirements.txt`** — 학습·추론 전용(로컬 GPU). `-r ../requirements.txt`로 수집 의존성을 상속하고 `torch`(cu128 전용 인덱스)·`transformers`·`numpy`를 더한다. **GitHub Actions는 이 파일을 설치하지 않는다** — 러너엔 GPU가 없고 torch 2.8GB를 매 실행 받을 이유가 없다.
 
 ### `.env` (gitignore됨)
 로컬 실행용 `YOUTUBE_API_KEY`, `DATABASE_URL`. GitHub Actions에서는 같은 이름의 Secrets가 환경변수로 주입되므로 **코드는 양쪽에서 동일하게 `os.environ`으로 읽음**.
@@ -108,9 +139,9 @@ cd part1
 pip install -r requirements.txt
 
 python migrate.py     # 스키마 생성/갱신 (주의: 운영 DB 대상)
-python collect.py     # 24시간치 수집 (테스트 DB에 적재)
-python backfill.py    # 과거 소급 수집 (필요할 때만, TOTAL_BUDGET 확인 후)
-python prune.py --dry-run    # 하한선보다 오래된 데이터 확인 (--yes로 실제 삭제)
+python Data/collect.py     # 24시간치 수집 (테스트 DB에 적재)
+python Data/backfill.py     # 과거 소급 수집 (필요할 때만, TOTAL_BUDGET 확인 후)
+python Data/prune.py --dry-run    # 하한선보다 오래된 데이터 확인 (--yes로 실제 삭제)
 ```
 
 ## 삭제된 파일

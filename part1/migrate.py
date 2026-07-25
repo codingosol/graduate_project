@@ -5,7 +5,7 @@ from pathlib import Path
 import psycopg2
 from dotenv import load_dotenv
 
-MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+MIGRATIONS_DIR = Path(__file__).parent / "DB_migrations"
 
 
 def apply_migrations(database_url: str) -> None:
