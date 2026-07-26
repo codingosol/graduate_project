@@ -150,15 +150,16 @@ def resolve_targets(conn, total_budget=TOTAL_BUDGET):
         """
         SELECT outlet_name, channel_type,
                GREATEST((backfill_cursor::date - %s::date), 0)  AS days_left,
-               GREATEST((now()::date - backfill_cursor::date), 0) AS days_since_cursor
+               GREATEST((now()::date - backfill_cursor::date), 0) AS days_since_cursor,
+               backfill_exhausted
         FROM channels
         """,
         (RETENTION_FLOOR,),
     )
     # 커서가 없는 채널(아직 한 번도 안 훑음)은 전 구간이 남은 것으로 본다.
     full_span = (datetime.now(timezone.utc).date() - BACKFILL_FLOOR.date()).days
-    stats = {(o, t): (dl if dl is not None else full_span, dsc if dsc is not None else 0)
-             for o, t, dl, dsc in cur.fetchall()}
+    stats = {(o, t): (dl if dl is not None else full_span, dsc if dsc is not None else 0, ex)
+             for o, t, dl, dsc, ex in cur.fetchall()}
 
     active = []
     for outlet_name, keys in CHANNELS.items():
@@ -167,9 +168,11 @@ def resolve_targets(conn, total_budget=TOTAL_BUDGET):
         for key_type, key_value, channel_type in keys:
             if (outlet_name, channel_type) not in TARGET_CHANNELS:
                 continue
-            left, since_cursor = stats.get((outlet_name, channel_type), (full_span, 0))
+            left, since_cursor, exhausted = stats.get((outlet_name, channel_type), (full_span, 0, False))
             if left <= 0:
                 continue  # 이미 하한 도달 — 예산을 주지 않는다
+            if exhausted:
+                continue  # 재생목록 물리 한계 도달(YTN·연합) — 더 백필해도 헛돈다
             # 필요량 = 커서까지 다시 넘기는 통과 비용 + 커서 아래로 더 내려가는 소급 비용.
             # 통과 비용을 빼먹으면 커서 깊은 채널(YTN)이 최소 예산만 받아 커서에 닿지도 못한다.
             need = since_cursor * PASS_UNITS_PER_DAY + left * UNITS_PER_DAY
@@ -273,6 +276,7 @@ def backfill_channel(api_key, db_pool, target):
         pages = 0
         oldest_scanned = resume_from
         reached_floor = False
+        playlist_end = False  # 재생목록의 물리적 끝(nextPageToken 없음)에 도달했는가
 
         while not tracker.exhausted() and pages < MAX_PAGES_PER_CHANNEL and not reached_floor:
             resp = youtube.playlistItems().list(
@@ -283,6 +287,7 @@ def backfill_channel(api_key, db_pool, target):
 
             items = resp.get("items", [])
             if not items:
+                playlist_end = True
                 break
 
             # 이미 수집한 구간은 건너뛰고, 그보다 오래되면서 하한선 안쪽인 것만 처리
@@ -375,14 +380,25 @@ def backfill_channel(api_key, db_pool, target):
 
             page_token = resp.get("nextPageToken")
             if not page_token:
+                playlist_end = True
                 break
 
+        # 재생목록 끝에 닿았는데 하한선까지 못 내려갔으면, 이 채널은 API가 허용하는 최고령
+        # (playlistItems 약 20,000편 한계)에 도달한 것이다. 더 백필해도 매번 헛돌 뿐이므로
+        # 플래그를 세워 다음부터 resolve_targets가 대상에서 뺀다.
+        exhausted = playlist_end and not reached_floor
+
         # 실제로 훑은 가장 오래된 지점을 커서로 저장 -> 다음 실행은 여기서 이어감
-        if oldest_scanned is not None:
-            with conn.cursor() as cur:
+        with conn.cursor() as cur:
+            if oldest_scanned is not None:
                 cur.execute(
                     "UPDATE channels SET backfill_cursor = %s WHERE channel_id = %s",
                     (oldest_scanned, channel_id),
+                )
+            if exhausted:
+                cur.execute(
+                    "UPDATE channels SET backfill_exhausted = TRUE WHERE channel_id = %s",
+                    (channel_id,),
                 )
 
         return {
@@ -394,6 +410,7 @@ def backfill_channel(api_key, db_pool, target):
             "used": tracker.used,
             "cursor": oldest_scanned,
             "reached_floor": reached_floor,
+            "exhausted": exhausted,
             "error": None,
         }
     except Exception as e:
@@ -460,7 +477,12 @@ def main():
             if r.get("error"):
                 print(f"  [실패] {r['outlet_name']}({r['channel_type']}): {r['error']} (사용 {r['used']})")
             else:
-                floor_mark = f" [하한 {RETENTION_FLOOR} 도달]" if r.get("reached_floor") else ""
+                if r.get("reached_floor"):
+                    floor_mark = f" [하한 {RETENTION_FLOOR} 도달]"
+                elif r.get("exhausted"):
+                    floor_mark = " [재생목록 한계 — 다음부터 제외]"
+                else:
+                    floor_mark = ""
                 cur_date = r["cursor"].date() if r.get("cursor") else "-"
                 print(
                     f"  {r['outlet_name']}({r['channel_type']}) {r['channel_title'][:18]:20} "
