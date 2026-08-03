@@ -97,8 +97,15 @@ def main():
               SELECT 1 FROM label_sample s
               WHERE s.run_id = %s AND s.comment_id = c.comment_id
           )
+          -- 평가셋(args.run)이 **아닌** run에 이미 라벨된 댓글은 제외한다 (오염 방지).
+          -- 학습셋(llm_train_v1)은 전 구간에서 뽑히므로, 나중에 겹치는 기간의 평가셋을
+          -- 뽑으면 학습셋과 겹칠 수 있다. 겹치면 '학습한 것을 채점'하게 되어 평가가 무효다.
+          AND NOT EXISTS (
+              SELECT 1 FROM comment_labels g
+              WHERE g.comment_id = c.comment_id AND g.run_id <> %s
+          )
         """,
-        (args.run, MIN_TEXT_LEN, MAX_TEXT_LEN, args.since, args.until, args.run),
+        (args.run, MIN_TEXT_LEN, MAX_TEXT_LEN, args.since, args.until, args.run, args.run),
     )
     pool = defaultdict(list)
     for comment_id, outlet, ctype, labeled in cur.fetchall():

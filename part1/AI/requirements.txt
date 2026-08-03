@@ -18,3 +18,8 @@ transformers==4.52.4
 
 # torch/transformers가 numpy를 끌어오지만, 재현성을 위해 실측 버전으로 고정한다.
 numpy==1.26.4
+
+# 추론 결과 집계(채널별 groupby). 데이터가 60만 행/66MB라 pandas로 충분하다
+# — Spark·polars는 이 규모에 오버엔지니어링(근거: Part1.md 3. 집계 도구).
+pandas==2.2.3
+
