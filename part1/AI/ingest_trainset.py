@@ -16,11 +16,6 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-
-from db import ensure_test_database
 
 # labeling_tool/은 저장소 루트(part1의 부모) 아래에 있다. AI/에서 두 단계 위로 올라간다.
 DEFAULT_DIR = os.path.join(
@@ -60,7 +55,7 @@ def main():
     if missing:
         print(f"  ⚠️ index에 없는 번호 {missing}건은 건너뜀")
 
-    conn = psycopg2.connect(ensure_test_database(database_url))
+    conn = psycopg2.connect(database_url)
     cur = conn.cursor()
     psycopg2.extras.execute_values(
         cur,
@@ -91,7 +86,6 @@ def main():
     overlap = cur.fetchone()[0]
     print(f"  평가셋과 중복: {overlap}건 {'✅' if overlap == 0 else '⚠️ 문제!'}")
     conn.close()
-
 
 if __name__ == "__main__":
     main()

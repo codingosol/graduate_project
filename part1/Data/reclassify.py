@@ -9,7 +9,7 @@
 수집 시점의 판정을 신뢰하지 않고 **항상 현재 기준으로 다시 매기는** 방식이라 몇 번을 실행해도 안전하다.
 데이터를 지우지 않고 플래그만 갱신하므로 되돌릴 수 있다.
 
-    python reclassify.py            # 테스트 DB 대상, 변경 내역 요약 출력
+    python reclassify.py            # 운영 DB 대상, 변경 내역 요약 출력
     python reclassify.py --dry-run  # 실제로 쓰지 않고 무엇이 바뀔지만 확인
 """
 
@@ -21,24 +21,16 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 from collect import is_political_title
 
 
-def test_database_url():
+def database_url():
     load_dotenv()
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise SystemExit("DATABASE_URL이 .env에 없습니다.")
-    if "?" in url:
-        head, query = url.split("?", 1)
-        query = "?" + query
-    else:
-        head, query = url, ""
-    return head.rsplit("/", 1)[0] + "/collect_test" + query
+    return url
 
 
 def main():
@@ -47,7 +39,7 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="쓰지 않고 결과만 확인")
     args = p.parse_args()
 
-    conn = psycopg2.connect(test_database_url())
+    conn = psycopg2.connect(database_url())
     with conn.cursor() as cur:
         cur.execute("SELECT video_id, title, is_political FROM videos")
         rows = cur.fetchall()

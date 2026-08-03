@@ -29,11 +29,7 @@ import psycopg2
 import torch
 from dotenv import load_dotenv
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from db import ensure_test_database
 from train import KO, LABELS, load_data, make_loader, predict, set_seed, train_model
 
 
@@ -68,7 +64,7 @@ def main():
         raise SystemExit("DATABASE_URL 환경변수가 필요합니다.")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    conn = psycopg2.connect(ensure_test_database(url))
+    conn = psycopg2.connect(url)
     train_rows, eval_rows, _ = load_data(conn, "llm")
     conn.close()
 
@@ -155,7 +151,6 @@ def main():
     print("\n   ※ 예측 '분포'가 학습셋 분포와 비슷한 것은 정상이다. 평가셋의 실제 분포가")
     print("     학습셋과 비슷하므로, 잘 맞히면 분포도 자연히 비슷해진다. 분포 일치는")
     print("     추론의 증거도 반증도 아니며, 가르는 것은 **건별 정확도**다.")
-
 
 if __name__ == "__main__":
     main()

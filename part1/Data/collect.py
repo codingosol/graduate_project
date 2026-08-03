@@ -15,11 +15,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from psycopg2.pool import ThreadedConnectionPool
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from db import ensure_test_database
 from keywords import load_keyword_groups, normalize
 
 DOMESTIC_KEYWORDS, GENERIC_KEYWORDS, FOREIGN_LEADER_EXCLUDE = load_keyword_groups()
@@ -73,7 +69,6 @@ CHANNELS = {
     "오마이TV": [("id", "UClAfLVQYZSLrMAQQ_SXPVZw", "news")],
     "연합뉴스TV": [("handle", "@yonhapnewstv23", "news")],
 }
-
 
 _thread_local = threading.local()
 
@@ -191,7 +186,6 @@ def apply_filters(recent_items, categories):
         filtered.append(item)
     return filtered
 
-
 COMMENT_INSERT_SQL = """
     INSERT INTO comments (
         comment_id, video_id, text, published_at, like_count,
@@ -228,7 +222,6 @@ def build_comment_row(comment_thread, video_id):
         snippet.get("authorChannelId", {}).get("value"),
         comment_thread["snippet"].get("totalReplyCount"),
     )
-
 
 # 영상당 저장할 댓글 수. API는 여전히 1페이지(최대 100건)를 받아오지만
 # (페이지 단위 과금이라 적게 요청해도 quota가 안 줄어든다), **저장은 20건만** 한다.
@@ -372,7 +365,6 @@ class Timings:
             print(f"  {key:22} {n:>5}회  누적 {total:>7.1f}초  평균 {total/n*1000:>6.0f}ms  "
                   f"(병렬 반영 시 약 {total/workers:>5.1f}초)")
 
-
 TIMINGS = Timings()
 
 
@@ -454,7 +446,6 @@ def main():
         raise SystemExit("YOUTUBE_API_KEY / DATABASE_URL 환경변수가 필요합니다.")
 
     print("=== 테스트 DB 준비 (운영 DB에는 적재하지 않음) ===")
-    test_database_url = ensure_test_database(database_url)
 
     bootstrap_youtube = make_youtube_client(api_key)
     category_names = fetch_category_names(bootstrap_youtube)
@@ -466,7 +457,7 @@ def main():
     # 반납된 연결을 보관하지 않고 그냥 close()해버린다. minconn=1이면 연결 1개만 남고 나머지는
     # 매번 새로 만들게 되는데, Neon(싱가포르)까지 새 연결을 여는 데 평균 1.7초가 들어
     # 이것이 전체 실행시간의 최대 병목이었다(계측: getconn 1,682ms vs API 139ms).
-    db_pool = ThreadedConnectionPool(DB_POOL_SIZE, DB_POOL_SIZE, test_database_url)
+    db_pool = ThreadedConnectionPool(DB_POOL_SIZE, DB_POOL_SIZE, database_url)
 
     conn = db_pool.getconn()
     conn.autocommit = True
@@ -561,8 +552,7 @@ def main():
     elapsed = time.perf_counter() - start_time
     print(f"\n[단계별] 1단계(채널/영상목록) {stage1_elapsed:.1f}초 / 2단계(댓글수집) {stage2_elapsed:.1f}초")
     TIMINGS.report(stage2_elapsed, VIDEO_WORKERS)
-    print(f"\n=== 완료: collect_test DB에 저장됨 (운영 DB 아님) — 총 소요시간 {elapsed:.1f}초 ===")
-
+    print(f"\n=== 완료: newstance(운영) DB에 저장됨 — 총 소요시간 {elapsed:.1f}초 ===")
 
 if __name__ == "__main__":
     main()

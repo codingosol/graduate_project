@@ -7,15 +7,15 @@ Part 1(뉴스 채널 정치성향 분석)의 `part1/` 디렉토리에 있는 각
 
 ```
 part1/
-├── db.py, migrate.py, DB_migrations/, requirements.txt   ← 공용 (Data·AI 양쪽이 씀)
+├── migrate.py, DB_migrations/, requirements.txt   ← 공용 (스키마·의존성)
 ├── Data/   collect · backfill · prune · reclassify · keywords(.py/.json)   ← 수집·ETL
-└── AI/     train · sanity_check · freeze_sample · sample_trainset · ingest_trainset · blind_check   ← 학습·라벨링
+└── AI/     train · sanity_check · freeze_sample · sample_trainset · ingest_trainset · blind_check · infer   ← 학습·라벨링·추론
 ```
 
 - **실행은 `part1/`에서** `python Data/collect.py`, `python AI/train.py` 형태.
-- **부트스트랩**: Data/·AI/ 스크립트는 상단에서 `sys.path`에 part1 루트를 추가해 공용 모듈
-  (`db`, `migrate`)을 import한다. 같은 디렉토리끼리(예: `backfill`→`collect`, `sanity_check`→`train`)는
-  파이썬이 실행 스크립트 디렉토리를 자동으로 넣어주므로 부트스트랩 없이 그대로 import된다.
+- **크로스 import**: 같은 디렉토리끼리(예: `backfill`→`collect`, `sanity_check`·`infer`→`train`)는
+  파이썬이 실행 스크립트 디렉토리를 `sys.path`에 자동으로 넣어주므로 그대로 import된다.
+  (예전엔 공용 `db.py`를 쓰려고 part1 루트를 `sys.path`에 넣는 부트스트랩이 있었으나, 운영 DB 단일화로 `db.py`가 사라져 제거했다.)
 
 ## 전체 흐름
 
@@ -27,9 +27,8 @@ YouTube Data API                    Neon PostgreSQL
       │  → commentThreads                  │
       ▼                                    │
   Data/collect.py  ──── 적재 ──────────────┘
-      │                        (현재는 테스트 DB `collect_test`에만 적재)
+      │                        (운영 DB `newstance`에 적재 — DATABASE_URL이 직접 가리킴)
       ├── Data/keywords.py / keywords.json  (2차 필터: 정치 키워드 판별)
-      ├── db.py                             (테스트 DB 생성·연결, 공용)
       └── migrate.py / DB_migrations/       (스키마 관리, 공용)
 ```
 
@@ -45,7 +44,7 @@ YouTube Data API                    Neon PostgreSQL
 - 댓글은 `execute_values`로 **영상당 1회 일괄 삽입**(건당 INSERT 대비 DB 왕복 대폭 절감)
 - `commentsDisabled`(HTTP 403)는 정상 케이스로 스킵하고 `videos.comments_disabled` 플래그 기록
 
-**주의**: 지금은 `ensure_test_database()`를 호출해 **테스트 DB(`collect_test`)에만 적재**함. 운영 DB 전환은 필터 추가 검증 후.
+**적재 대상**: `DATABASE_URL`(운영 DB `newstance`)에 직접 적재한다. 1·2차 필터 검증을 마친 뒤, 그동안 쓰던 테스트 DB `collect_test`를 `newstance`로 rename해 운영으로 승격했다(2026-08-03). 예전의 test/운영 분리(`ensure_test_database`)와 공용 `db.py`는 제거됐다.
 
 ### `keywords.json` — 정치 키워드 데이터
 2차 필터가 쓰는 키워드를 코드와 분리해 데이터로 관리(정치인·정당명은 시간이 지나면 낡아지므로 갱신이 잦음).
@@ -64,9 +63,6 @@ YouTube Data API                    Neon PostgreSQL
 >
 > **왜 정규화가 필요한가.** 헤드라인의 `李`가 표준 한자(U+674E)가 아니라 **CJK 호환용 한자(U+F9E1)**로 들어오는 경우가 있다. 눈에는 같지만 `in`이 False를 낸다. 실측 413개 제목에 호환용 한자가 있었고 7건이 이 때문에 누락돼 있었다.
 
-### `db.py` — 테스트 DB 관리
-`ensure_test_database()`: 운영 `DATABASE_URL`과 같은 Neon 프로젝트 안에 테스트 전용 DB(`collect_test`)를 만들고 마이그레이션까지 적용한 뒤 그 DB의 연결 문자열을 반환. **운영 DB 테이블은 건드리지 않음.**
-
 ### `migrate.py` + `DB_migrations/` — 스키마 마이그레이션
 - `DB_migrations/0001_init.sql`: outlets / channels / videos / comments 테이블 + 인덱스
 - `DB_migrations/0002_slim_raw.sql`: `raw JSONB` 제거 + 필요 필드(`author_channel_id`, `total_reply_count`) 추출, `text`를 textOriginal로 교체. **UPDATE 대신 새 테이블로 교체하는 방식** — 제자리 UPDATE는 22만 행 재작성에 용량이 2배 필요해 Neon 512MB 한도에 걸렸었음
@@ -77,7 +73,7 @@ YouTube Data API                    Neon PostgreSQL
 - `DB_migrations/0007_label_sample.sql`: 평가셋 표본을 고정하는 `label_sample` 테이블. `comments`를 **`ON DELETE RESTRICT`로** 참조한다(`comment_labels`의 CASCADE와 반대) — 표본이 삭제되면 실험이 무효가 되므로 전파시키지 않고 아예 막는다
 - `migrate.py`: 아직 적용 안 된 `.sql` 파일만 순서대로 실행하고 `schema_migrations` 테이블에 이력 기록
 - **스키마를 바꿀 땐 기존 파일을 수정하지 말고 `0002_xxx.sql` 같은 새 파일을 추가할 것** (기존 파일 수정 시 이미 적용된 DB와 어긋남)
-- 실행: `python migrate.py` — **주의: 이건 `DATABASE_URL`(운영 DB) 대상임.** 테스트 DB에 적용하려면 `db.ensure_test_database()`를 쓰거나 test URL로 `apply_migrations()`를 직접 호출할 것
+- 실행: `python migrate.py` — `DATABASE_URL`(운영 DB `newstance`) 대상. 각 수집·학습 스크립트도 실행 시 같은 DB에 직접 연결한다.
 
 ### `backfill.py` — 과거 영상 소급 수집
 매일 24시간치만 모으는 `collect.py`와 달리 **더 과거로** 소급 수집하는 도구. 상시 실행하지 않고, 하루 남은 쿼터에 맞춰 수동으로 돌린다.
@@ -104,10 +100,10 @@ YouTube Data API                    Neon PostgreSQL
 ## AI/ — 학습·라벨링
 
 ### `train.py` — 성향 분류기 학습
-`beomi/KcELECTRA-base-v2022` 파인튜닝. 학습 700건(`llm_train_v1`) / 평가 150건(`manual_gold_v1`).
+`beomi/KcELECTRA-base-v2022` 파인튜닝. 학습셋은 `--train-run`으로 고른다(기본 `llm_train_v1`) / 평가 300건(`manual_gold_v1`). 최종 배포 모델은 v2 라벨 1000건(`llm_train_v2_big`)으로 학습해 `models/kcelectra_v2`에 저장했다(근거: `../DECISIONS.md` 08-03).
 
-- **평가셋 오염 차단이 SQL에 박혀 있다** — `run_id='manual_gold_v1'`인 라벨 전부(잉여분 포함)를 학습에서 제외한다. `label_sample` 150건만 빼면 잉여 라벨이 2차분 표본으로 편입될 때 오염된다.
-- `--curve`(100/250/500/700 학습곡선, **스텝 수 고정**), `--labels human-first`(맹검 100건을 사람 라벨로 교체), `--class-weights`(드문 클래스 보정), `--save DIR`(모델 저장).
+- **평가셋 오염 차단이 SQL에 박혀 있다** — `run_id='manual_gold_v1'`인 라벨 전부(잉여분 포함)를 학습에서 제외한다.
+- `--train-run RUN`(학습셋 run_id 지정), `--curve`(학습곡선, **스텝 수 고정**), `--tune`(dev로 하이퍼파라미터 선택 후 평가셋 1회 측정), `--labels human-first`(맹검 100건을 사람 라벨로 교체), `--class-weights`(드문 클래스 보정), `--save DIR`(모델 저장).
 - **epoch을 너무 작게 두면 학습이 안 된다** — 700÷32=22스텝/epoch이라 4 epoch(88스텝)은 부족해 `좌`·`불가`를 아예 예측 못 한다. 기본 15 epoch(330스텝).
 
 ### `sanity_check.py` — 순열 검정
@@ -125,6 +121,13 @@ YouTube Data API                    Neon PostgreSQL
 > `sample_trainset`·`ingest_trainset`이 쓰는 청크 파일은 저장소 루트의 `labeling_tool/trainset/`에
 > 있다(gitignore). AI/에서 두 단계 위(`../../`)라, 기본 경로가 그렇게 잡혀 있고 `--out`/`--dir`로 바꿀 수 있다.
 
+### `infer.py` — 전체 댓글 추론·적재 (Part 1 결론 단계)
+학습된 모델을 전체 댓글에 적용해 채널별 성향 점수를 낸다. 개별 정확도가 아니라 **채널 순위가 통념과 맞는가**가 목적이다(수만 건 평균이라 개별 오차는 상쇄된다).
+
+- **Neon 접근은 앞뒤 한 번씩만** — 시작에 댓글을 fetch → GPU로 전부 추론 → 완료 후 `comment_labels`에 청크 배치 UPSERT(추론 중에는 DB 미접근). label=argmax, score=P(우)−P(좌), confidence=max prob.
+- **2축 확장 대비** — 축별 후처리를 `AXIS_CONFIG`로 분리했다. `leaning`(기본)만 구현돼 있고, 강도 축(K-HATERS)은 후처리 함수 하나만 추가하면 `--axis intensity`로 붙는다.
+- 기본 모델 `models/kcelectra_v2`, run_id `model_kcelectra_v2`. `results/<run_id>.txt`(채널 순위·분포)와 `.progress`(진행률)를 로컬에도 남긴다(`results/`는 gitignore).
+
 ### `requirements.txt` (수집용) / `AI/requirements.txt` (학습용)
 - **`requirements.txt`** — 수집·ETL과 CI가 쓴다. `google-api-python-client` / `psycopg2-binary` / `python-dotenv`. 병렬 처리는 표준 라이브러리(`concurrent.futures`)라 별도 의존성 없음.
 - **`AI/requirements.txt`** — 학습·추론 전용(로컬 GPU). `-r ../requirements.txt`로 수집 의존성을 상속하고 `torch`(cu128 전용 인덱스)·`transformers`·`numpy`를 더한다. **GitHub Actions는 이 파일을 설치하지 않는다** — 러너엔 GPU가 없고 torch 2.8GB를 매 실행 받을 이유가 없다.
@@ -138,14 +141,15 @@ YouTube Data API                    Neon PostgreSQL
 cd part1
 pip install -r requirements.txt
 
-python migrate.py     # 스키마 생성/갱신 (주의: 운영 DB 대상)
-python Data/collect.py     # 24시간치 수집 (테스트 DB에 적재)
+python migrate.py     # 스키마 생성/갱신 (운영 DB newstance 대상)
+python Data/collect.py     # 24시간치 수집 (운영 DB newstance에 적재)
 python Data/backfill.py     # 과거 소급 수집 (필요할 때만, TOTAL_BUDGET 확인 후)
 python Data/prune.py --dry-run    # 하한선보다 오래된 데이터 확인 (--yes로 실제 삭제)
 ```
 
 ## 삭제된 파일
 
+- `db.py` — test/운영 DB 분리(`ensure_test_database`)를 담당했으나, 필터 검증 후 `collect_test`를 운영 DB `newstance`로 rename·승격하면서 분리가 불필요해져 삭제(2026-08-03). 각 스크립트는 이제 `DATABASE_URL`에 직접 연결하며, 이때 각 파일의 `sys.path` 부트스트랩도 함께 제거했다.
 - `quick_test.py` — API 연결 확인용 임시 스크립트였고, 기능(채널 조회 → 영상 목록 → 댓글 수집 + `commentsDisabled` 예외처리)이 전부 `collect.py`에 흡수돼서 삭제함
 - 일회성 진단 스크립트 다수(드리프트 검정, 용량 측정, 채널 검증, 라벨 검토 등) — 결론만 `../DECISIONS.md`에 남기고 스크립트는 삭제. 전부 특정 시점의 DB 상태를 전제로 한 것이라 나중에 다시 돌려도 같은 답이 안 나온다
 - `cap_comments.py` — 영상당 댓글 20건 상한을 과거 데이터에 소급 적용한 도구. 1회 실행 후 삭제했다. `comments`에 INSERT하는 경로가 `collect.py`·`backfill.py` 둘뿐이고 둘 다 `select_comments()`를 지나므로 상한이 깨질 수 있는 경로가 없다. 무엇보다 **같은 선별 규칙을 Python과 SQL 두 벌로 들고 있는 상태**라서, 남겨두면 한쪽만 고쳐 어긋나는 사고를 부른다. 상한 값을 바꿔 소급 재적용할 일이 생기면 그때 다시 쓴다

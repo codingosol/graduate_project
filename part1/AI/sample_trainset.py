@@ -19,11 +19,6 @@ from collections import Counter, defaultdict
 import psycopg2
 from dotenv import load_dotenv
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-
-from db import ensure_test_database
 
 MIN_TEXT_LEN = 10    # labeling_tool/label.py와 같은 값
 MAX_TEXT_LEN = 600
@@ -82,7 +77,7 @@ def main():
     if not database_url:
         raise SystemExit("DATABASE_URL 환경변수가 필요합니다.")
 
-    conn = psycopg2.connect(ensure_test_database(database_url))
+    conn = psycopg2.connect(database_url)
     cur = conn.cursor()
 
     cur.execute(
@@ -163,7 +158,6 @@ def main():
     print(f"\n표본 {len(chosen)}건 → 청크 {n_chunks}개 ({out_dir})")
     print(f"run_id: {args.run}")
     conn.close()
-
 
 if __name__ == "__main__":
     main()

@@ -25,10 +25,6 @@ import psycopg2.extras
 from dotenv import load_dotenv
 from psycopg2.pool import ThreadedConnectionPool
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-
 from collect import (
     CHANNELS,
     COMMENT_INSERT_SQL,
@@ -40,7 +36,6 @@ from collect import (
     sanitize_text,
     select_comments,
 )
-from db import ensure_test_database
 
 CHANNEL_WORKERS = 6  # 동시에 처리할 채널 수
 VIDEO_WORKERS = 5  # 채널 내부에서 댓글을 동시에 조회할 영상 수 (총 스레드 6x5=30)
@@ -436,12 +431,11 @@ def main():
     if not api_key or not database_url:
         raise SystemExit("YOUTUBE_API_KEY / DATABASE_URL 환경변수가 필요합니다.")
 
-    test_database_url = ensure_test_database(database_url)
     # minconn = maxconn으로 둔다. psycopg2의 putconn은 보유 연결이 minconn 이상이면 반납된 연결을
     # 보관하지 않고 close()하므로, minconn이 작으면 매번 새 연결을 만들게 된다
     # (Neon까지 새 연결 생성에 평균 1.7초 — collect.py에서 최대 병목이었음).
     pool_size = CHANNEL_WORKERS + 4
-    db_pool = ThreadedConnectionPool(pool_size, pool_size, test_database_url)
+    db_pool = ThreadedConnectionPool(pool_size, pool_size, database_url)
 
     conn = db_pool.getconn()
     conn.autocommit = True
@@ -493,7 +487,6 @@ def main():
     used = sum(r["used"] for r in results)
     new = sum(r.get("new_videos", 0) for r in results)
     print(f"\n=== 완료: 신규 정치영상 {new:,}건, quota 사용 약 {used:,} unit, {time.perf_counter()-start:.0f}초 ===")
-
 
 if __name__ == "__main__":
     main()

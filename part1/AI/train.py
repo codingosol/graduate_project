@@ -43,11 +43,6 @@ import torch.nn.functional as F
 from dotenv import load_dotenv
 from torch.utils.data import DataLoader, TensorDataset
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-
-from db import ensure_test_database
 
 MODEL_NAME = "beomi/KcELECTRA-base-v2022"
 LABELS = ("left", "right", "neutral", "unusable")
@@ -73,12 +68,14 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def load_data(conn, label_source):
+def load_data(conn, label_source, train_run=TRAIN_RUN):
     """학습셋과 평가셋을 DB에서 읽는다.
 
     label_source:
       'llm'         — 학습 라벨 전부 LLM이 매긴 것 (기본)
       'human-first' — 같은 댓글에 사람 라벨(맹검)이 있으면 그것으로 교체
+    train_run:
+      학습셋 run_id. 기본 llm_train_v1. 라벨 재생성 실험(v2 등)에서 바꿔 넣는다.
     """
     cur = conn.cursor()
 
@@ -111,7 +108,7 @@ def load_data(conn, label_source):
           )
         ORDER BY c.comment_id
         """,
-        (TRAIN_RUN, EVAL_RUN),
+        (train_run, EVAL_RUN),
     )
     tr = cur.fetchall()
 
@@ -344,6 +341,8 @@ def main():
     p = argparse.ArgumentParser(description="댓글 성향 분류기 학습")
     p.add_argument("--labels", choices=["llm", "human-first"], default="llm",
                    help="학습 라벨 출처. human-first는 맹검 100건을 사람 라벨로 교체")
+    p.add_argument("--train-run", default=TRAIN_RUN,
+                   help="학습셋 run_id (기본 llm_train_v1). 라벨 재생성 실험에서 바꾼다")
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--batch", type=int, default=32, help="VRAM 6GB 실측 기준값")
     p.add_argument("--lr", type=float, default=2e-5)
@@ -367,11 +366,12 @@ def main():
     if device == "cpu":
         print("⚠️ GPU를 찾지 못했습니다. CPU로도 돌아가지만 수십 배 느립니다.\n")
 
-    conn = psycopg2.connect(ensure_test_database(url))
-    train_rows, eval_rows, swapped = load_data(conn, args.labels)
+    conn = psycopg2.connect(url)
+    train_rows, eval_rows, swapped = load_data(conn, args.labels, args.train_run)
     conn.close()
 
-    print(f"학습 {len(train_rows)}건 / 평가 {len(eval_rows)}건   라벨 출처: {args.labels}")
+    print(f"학습 {len(train_rows)}건 / 평가 {len(eval_rows)}건   "
+          f"라벨 출처: {args.labels}  run: {args.train_run}")
     if swapped:
         print(f"  사람 라벨로 교체된 것 {swapped}건 (나머지는 두 라벨이 같았음)")
     tc = Counter(y for _, y in train_rows)
@@ -448,7 +448,6 @@ def main():
         model.save_pretrained(args.save)
         tokenizer.save_pretrained(args.save)
         print(f"\n모델 저장: {args.save}")
-
 
 if __name__ == "__main__":
     main()

@@ -31,11 +31,6 @@ from collections import Counter, defaultdict
 import psycopg2
 from dotenv import load_dotenv
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-
-from db import ensure_test_database
 
 SOURCE_RUN = "llm_train_v1"
 BLIND_RUN = "blind_check_v1"
@@ -48,7 +43,7 @@ def connect():
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise SystemExit("DATABASE_URL 환경변수가 필요합니다.")
-    return psycopg2.connect(ensure_test_database(url))
+    return psycopg2.connect(url)
 
 
 def prepare(conn, size):
@@ -190,7 +185,6 @@ def main():
     else:
         compare(conn)
     conn.close()
-
 
 if __name__ == "__main__":
     main()

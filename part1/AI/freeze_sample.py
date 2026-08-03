@@ -38,11 +38,6 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-
-from db import ensure_test_database
 
 MIN_TEXT_LEN = 10   # labeling_tool/label.py와 같은 값이어야 한다
 MAX_TEXT_LEN = 600
@@ -67,7 +62,7 @@ def main():
     if not database_url:
         raise SystemExit("DATABASE_URL 환경변수가 필요합니다.")
 
-    conn = psycopg2.connect(ensure_test_database(database_url))
+    conn = psycopg2.connect(database_url)
     cur = conn.cursor()
 
     # 이미 고정된 표본은 절대 건드리지 않는다. 이번 차수는 그 뒤에 이어 붙일 뿐이다.
@@ -151,7 +146,6 @@ def main():
     if surplus:
         print(f"  목표를 넘어 표본에 넣지 않은 기존 라벨 {surplus}건은 그대로 남아 학습용 여분이 됩니다.")
     conn.close()
-
 
 if __name__ == "__main__":
     main()

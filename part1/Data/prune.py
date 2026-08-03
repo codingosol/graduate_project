@@ -26,11 +26,6 @@ import sys
 import psycopg2
 from dotenv import load_dotenv
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db, migrate)을 Data/·AI/ 어디서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-
-from db import ensure_test_database
 
 # 수집 하한선. 이 시각보다 이전에 업로드된 영상은 보관하지 않는다.
 # 2026-07-21 기준 약 3개월. 모든 채널의 공통 커버 기간을 이 날짜로 통일한다.
@@ -90,7 +85,7 @@ def main():
     if not database_url:
         raise SystemExit("DATABASE_URL 환경변수가 필요합니다.")
 
-    conn = psycopg2.connect(ensure_test_database(database_url))
+    conn = psycopg2.connect(database_url)
     cur = conn.cursor()
 
     videos, comments, labels, sampled = summarize(cur, args.floor)
@@ -146,7 +141,6 @@ def main():
     print("  ※ 물리 크기 표시는 바로 줄지 않을 수 있습니다. 회수된 공간은 테이블 내부에")
     print("    재사용 가능 상태로 남아 backfill의 신규 INSERT가 그대로 채워 씁니다.")
     conn.close()
-
 
 if __name__ == "__main__":
     main()

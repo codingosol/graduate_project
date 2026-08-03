@@ -36,11 +36,7 @@ import psycopg2
 import psycopg2.extras
 import torch
 
-# part1/ 루트를 경로에 추가 — 공용 모듈(db)을 AI/에서 실행해도 찾도록.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from db import ensure_test_database
 from train import KO, L2I, LABELS, MAX_LEN
 
 MIN_TEXT_LEN = 10   # sample_trainset.py와 같은 값 — 학습/추론 분포 일치
@@ -55,10 +51,10 @@ CONVENTION = {
     "연합뉴스TV": "중도/공영",
 }
 
-
 # ── 축별 후처리 ────────────────────────────────────────────────────────────
 # prob: (N, C) softmax 확률 → (label_str 배열, score 배열, confidence 배열)
 # label은 comment_labels.label CHECK('left'/'right'/'neutral'/'unusable', NULL 허용)에 맞춘다.
+
 
 def _postprocess_leaning(prob):
     li, ri = L2I["left"], L2I["right"]
@@ -68,12 +64,11 @@ def _postprocess_leaning(prob):
     conf = prob.max(axis=1).astype(np.float32)
     return labels, scores, conf
 
-
 AXIS_CONFIG = {
     "leaning": {
         "post": _postprocess_leaning,
-        "default_model": os.path.join(os.path.dirname(__file__), "..", "..", "models", "kcelectra_v1"),
-        "default_run": "model_kcelectra_v1",
+        "default_model": os.path.join(os.path.dirname(__file__), "..", "..", "models", "kcelectra_v2"),
+        "default_run": "model_kcelectra_v2",
     },
     # "intensity": {  # 강도 축 도입(K-HATERS) 시 여기에 후처리·기본 모델·run_id를 추가.
     #     "post": _postprocess_intensity,   # label=None, score=과격도(0~1)
@@ -207,7 +202,7 @@ def main():
     model = AutoModelForSequenceClassification.from_pretrained(model_path).to(device).eval()
 
     # ── ① 시작: 댓글을 한 번 fetch (이후 추론 끝까지 DB 접근 없음) ──
-    conn = psycopg2.connect(ensure_test_database(url))
+    conn = psycopg2.connect(url)
     cur = conn.cursor()
     q = """
         SELECT c.comment_id, c.text, ch.outlet_name, ch.channel_type, c.like_count
@@ -236,7 +231,7 @@ def main():
 
     # ── ③ 완료 후: DB 배치 적재 ──
     if not args.no_db:
-        conn = psycopg2.connect(ensure_test_database(url))
+        conn = psycopg2.connect(url)
         save_to_db(conn, run_id, args.axis, os.path.basename(model_path.rstrip("/\\")),
                    ids, labels, scores, confs)
         conn.close()
@@ -268,7 +263,6 @@ def main():
     if os.path.exists(prog_path):
         os.remove(prog_path)   # 완료됐으므로 진행률 파일 정리
     print(f"\n로컬 요약 저장: {summary_path}")
-
 
 if __name__ == "__main__":
     main()
