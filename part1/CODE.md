@@ -9,7 +9,8 @@ Part 1(뉴스 채널 정치성향 분석)의 `part1/` 디렉토리에 있는 각
 part1/
 ├── migrate.py, DB_migrations/, requirements.txt   ← 공용 (스키마·의존성)
 ├── Data/   collect · backfill · prune · reclassify · keywords(.py/.json)   ← 수집·ETL
-└── AI/     train · sanity_check · freeze_sample · sample_trainset · ingest_trainset · blind_check · infer   ← 학습·라벨링·추론
+├── AI/     train · sanity_check · freeze_sample · sample_trainset · ingest_trainset · blind_check · infer   ← 학습·라벨링·추론
+└── viz/    app · views/ · queries · theme · util (+ DESIGN.md)   ← 시각화 대시보드(Streamlit, 로컬)
 ```
 
 - **실행은 `part1/`에서** `python Data/collect.py`, `python AI/train.py` 형태.
@@ -71,6 +72,8 @@ YouTube Data API                    Neon PostgreSQL
 - `DB_migrations/0005_drop_label_comment_index.sql`: 0004에서 넣은 `idx_comment_labels_comment` 제거 — 79.9만 행 실측에서 플래너가 한 번도 쓰지 않으면서 33MB만 차지했음
 - `DB_migrations/0006_label_unusable.sql`: 라벨 값에 `unusable` 추가 — `neutral`(정치적이나 편향 없음)과 판단 대상이 아닌 잡음("ㅋㅋㅋ", "1등", 광고)을 구분. 뭉치면 모델이 "노이즈=중립"을 학습해 채널 점수가 0쪽으로 끌린다
 - `DB_migrations/0007_label_sample.sql`: 평가셋 표본을 고정하는 `label_sample` 테이블. `comments`를 **`ON DELETE RESTRICT`로** 참조한다(`comment_labels`의 CASCADE와 반대) — 표본이 삭제되면 실험이 무효가 되므로 전파시키지 않고 아예 막는다
+- `DB_migrations/0008_backfill_exhausted.sql`: `channels.backfill_exhausted` 추가 — `playlistItems`가 최근 ~2만 편까지만 접근 가능해 하한(04-21)에 못 닿는 고업로드 채널(YTN·연합뉴스TV)을 완주로 인정해 `resolve_targets`에서 제외하기 위함
+- `DB_migrations/0009_channel_thumbnail.sql`: `channels.thumbnail_url` 추가 — 시각화 대시보드의 채널 카드 로고용. `channels.list`(snippet.thumbnails)로 13개 채널 1회 수집
 - `migrate.py`: 아직 적용 안 된 `.sql` 파일만 순서대로 실행하고 `schema_migrations` 테이블에 이력 기록
 - **스키마를 바꿀 땐 기존 파일을 수정하지 말고 `0002_xxx.sql` 같은 새 파일을 추가할 것** (기존 파일 수정 시 이미 적용된 DB와 어긋남)
 - 실행: `python migrate.py` — `DATABASE_URL`(운영 DB `newstance`) 대상. 각 수집·학습 스크립트도 실행 시 같은 DB에 직접 연결한다.
@@ -135,6 +138,26 @@ YouTube Data API                    Neon PostgreSQL
 ### `.env` (gitignore됨)
 로컬 실행용 `YOUTUBE_API_KEY`, `DATABASE_URL`. GitHub Actions에서는 같은 이름의 Secrets가 환경변수로 주입되므로 **코드는 양쪽에서 동일하게 `os.environ`으로 읽음**.
 
+## viz/ — 시각화 대시보드 (Streamlit, 로컬)
+
+추론 결과(`comment_labels`)를 보고서용으로 탐색·캡처하는 로컬 대시보드. 설계 정본은 `viz/DESIGN.md`,
+배경·경위는 [Part1.md](Part1.md) §8과 `../DECISIONS.md` 08-04 (4). 의존성은 `viz/requirements.txt` 별도
+(`streamlit`·`plotly`·`pandas`·`psycopg2-binary`·`python-dotenv`). 실행: `cd part1/viz && streamlit run app.py`.
+
+| 파일 | 역할 |
+|---|---|
+| `app.py` | 진입점. `st.navigation` 멀티페이지(대시보드·채널 별 통계·채널 비교) + 공용 폰트(Pretendard)/배경 CSS. ⚠️ `font-family:*` 전역 지정이 material 아이콘 폰트를 덮어 아이콘이 글자로 새므로 아이콘 폰트를 명시 복원한다. 기본 우상단 실행 인디케이터는 숨기고 중앙 원형 스피너로 대체 |
+| `views/dashboard.py` | 채널 행(HTML 카드: 로고+이름 밀착, 카드 전체 클릭 시 `?outlet=`로 상세 이동) + 좌\|중립\|우 3색 그라데이션 바(중립 저채도). ⚠️ `st.image(...) if x else ...` 삼항은 Streamlit magic으로 화면에 새어 나가므로 if/else 문으로 쓴다 |
+| `views/channel_stats.py` | 채널 일별 좌%·우% 시계열. 원시/EMA 전환은 **plotly updatemenus 버튼(클라이언트)** — Streamlit 위젯이면 매번 서버 rerun이라 전환이 뚝뚝 끊긴다. 하단 x축 공유 댓글 수 막대(영상 수 hover). 강도 탭은 자리만 |
+| `views/compare.py` | 채널별 '판정 중 우비율' EMA를 한 그래프에 채널 브랜드색으로 겹침 + 50% 균형선 |
+| `queries.py` | DB 집계(모두 `@st.cache_data`). **미분류 배제가 여기 박혀 있다** — `comment_labels`(run=`model_kcelectra_v2`)와 inner join이라 collect.py가 지금 쌓는 미추론 신규 댓글은 자동 제외(`unusable` 제외, `neutral` 포함). `RUN_BY_AXIS`로 축→run_id 매핑(강도 축 대비) |
+| `theme.py` | Sentry 다크 팔레트(`COLORS`)·채널 브랜드색(`CHANNEL_COLORS`)·성향 관례(`CONVENTION`) |
+| `util.py` | `center_spinner()` — 화면 중앙 원형 로딩 스피너 컨텍스트매니저 |
+
+- **미추론 신규 댓글이 계속 쌓여도 결과가 안 흔들린다**(inner join 배제) — collect.py를 켜둔 채 대시보드를 봐도 된다.
+- ⚠️ **`queries.py` 등에 함수를 새로 추가하면 서버를 재시작해야** 반영된다(streamlit이 import한 모듈을 캐시하기 때문).
+- 강도 축은 `RUN_BY_AXIS`·채널 별 통계 "강도" 탭·대시보드 "축" 라디오에 자리가 뚫려 있다 — `model_khaters_v1` 적재 시 연결.
+
 ## 실행 방법
 
 ```bash
@@ -145,6 +168,10 @@ python migrate.py     # 스키마 생성/갱신 (운영 DB newstance 대상)
 python Data/collect.py     # 24시간치 수집 (운영 DB newstance에 적재)
 python Data/backfill.py     # 과거 소급 수집 (필요할 때만, TOTAL_BUDGET 확인 후)
 python Data/prune.py --dry-run    # 하한선보다 오래된 데이터 확인 (--yes로 실제 삭제)
+
+python AI/infer.py     # 전체 댓글 추론·적재 (기본 models/kcelectra_v2, run_id=model_kcelectra_v2)
+
+cd viz && streamlit run app.py     # 시각화 대시보드 (로컬 브라우저)
 ```
 
 ## 삭제된 파일

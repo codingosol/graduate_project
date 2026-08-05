@@ -1,0 +1,11 @@
+# Sentry 다크 테마 (DESIGN.md §1·§4). streamlit run 을 part1/viz/ 에서 실행하면 적용된다.
+[theme]
+base = "dark"
+primaryColor = "#6C5FC7"             # 액센트(purple300) — 선택·링크·강조
+backgroundColor = "#1D1127"          # canvas
+secondaryBackgroundColor = "#2B1D38" # surface — 카드·사이드바
+textColor = "#E7E1EC"                # ink-strong
+font = "sans serif"
+
+[server]
+headless = true

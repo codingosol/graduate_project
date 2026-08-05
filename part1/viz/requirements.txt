@@ -1,0 +1,9 @@
+# 시각화 대시보드 전용 의존성 (로컬 실행). 수집 CI·학습과 무관.
+# 설치:  pip install -r part1/viz/requirements.txt
+# 실행:  cd part1/viz && streamlit run app.py
+
+streamlit>=1.39
+plotly>=5.24
+pandas>=2.2
+psycopg2-binary
+python-dotenv

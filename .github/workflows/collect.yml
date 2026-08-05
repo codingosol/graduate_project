@@ -10,8 +10,11 @@ name: daily-collect
 #   (근거: DECISIONS.md 2026-07-20 "학습·추론 실행 위치")
 
 on:
-  schedule:
-    - cron: '0 18 * * *'   # 매일 UTC 18:00 = KST 03:00. 실행 시점 기준 최근 24시간을 수집
+  # ⏸ 일일 자동 수집 일시 중단(2026-08-05). Neon 무료 티어(512MB) 용량 확보 및 강도 축
+  #   도입을 정리하는 동안 데이터가 계속 늘지 않게 스케줄을 껐다. 재개하려면 아래 주석을 되살린다.
+  #   (성향 축 분석 코퍼스는 2026-04-21~08-02로 이미 고정·완결 상태)
+  # schedule:
+  #   - cron: '0 18 * * *'   # 매일 UTC 18:00 = KST 03:00. 실행 시점 기준 최근 24시간을 수집
   workflow_dispatch:        # 필요 시 수동 실행
 
 # 이전 실행이 아직 돌고 있으면 겹쳐 돌리지 않는다(중복 수집·쿼터 낭비 방지)
@@ -43,5 +46,6 @@ jobs:
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          # collect.py는 현재 ensure_test_database()로 collect_test DB에만 적재한다.
-          # 운영 DB 전환은 필터 검증 완료 후 별도로 진행(Part1.md 3. 인프라 참고).
+          # collect.py는 DATABASE_URL이 가리키는 운영 DB(newstance)에 직접 적재한다(2026-08-04 전환).
+          # ⚠️ GitHub Secrets의 DATABASE_URL이 /newstance를 가리키는지 확인할 것
+          #    (구 /neondb를 가리키면 빈 DB로 새어 나간다). 스케줄 재개 전 필수 점검.
