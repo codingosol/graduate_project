@@ -3,7 +3,7 @@
 import plotly.graph_objects as go
 import streamlit as st
 
-from queries import channel_summary, channel_timeseries
+from queries import all_channels_timeseries, channel_summary
 from theme import CHANNEL_COLORS, COLORS
 from util import center_spinner
 
@@ -27,20 +27,21 @@ if not sel:
 fig = go.Figure()
 starts, ends = [], []   # 채널별 데이터 시작·끝 → 공통 기간(교집합) 계산용
 with center_spinner():
-    for outlet in sel:
-        ts = channel_timeseries(outlet).sort_values("wk")
-        if ts.empty:
-            continue
-        starts.append(ts["wk"].min())
-        ends.append(ts["wk"].max())
-        dec = ts["l"] + ts["r"]
-        rr = (ts["r"] / dec.where(dec > 0) * 100)     # 판정 중 우비율(판정 0인 날은 NaN)
-        # EMA는 각 채널의 전체 이력으로 계산(왼쪽 끝에서 데워진 값) 후, 보기만 공통 기간으로 자른다.
-        ema = rr.ewm(span=span, ignore_na=True).mean()
-        fig.add_trace(go.Scatter(
-            x=ts["wk"], y=ema, name=outlet, mode="lines",
-            line=dict(color=CHANNEL_COLORS.get(outlet, COLORS["ink_muted"]), width=2.4),
-            hovertemplate="%{x|%m-%d} · " + outlet + " %{y:.1f}%<extra></extra>"))
+    allts = all_channels_timeseries()   # 전 채널을 한 쿼리로(채널마다 따로 부르면 10배 느림)
+for outlet in sel:
+    ts = allts[allts["outlet"] == outlet].sort_values("wk")
+    if ts.empty:
+        continue
+    starts.append(ts["wk"].min())
+    ends.append(ts["wk"].max())
+    dec = ts["l"] + ts["r"]
+    rr = (ts["r"] / dec.where(dec > 0) * 100)     # 판정 중 우비율(판정 0인 날은 NaN)
+    # EMA는 각 채널의 전체 이력으로 계산(왼쪽 끝에서 데워진 값) 후, 보기만 공통 기간으로 자른다.
+    ema = rr.ewm(span=span, ignore_na=True).mean()
+    fig.add_trace(go.Scatter(
+        x=ts["wk"], y=ema, name=outlet, mode="lines",
+        line=dict(color=CHANNEL_COLORS.get(outlet, COLORS["ink_muted"]), width=2.4),
+        hovertemplate="%{x|%m-%d} · " + outlet + " %{y:.1f}%<extra></extra>"))
 
 # 공통 기간 = 선택 채널들이 모두 데이터를 가진 구간(가장 늦은 시작 ~ 가장 이른 끝).
 # 겹치는 구간이 없으면(교집합 없음) 자동 범위(합집합)로 둔다.

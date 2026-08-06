@@ -97,5 +97,60 @@ with tab_lean:
                "세로 %=주별 좌/우 비율, 하단=주별 댓글 수(hover에 영상 수).")
 
 with tab_int:
-    st.info("강도 축(K-HATERS 기반 과격도)은 아직 도입 전입니다. "
-            "`model_khaters_v1` run이 적재되면 여기에 동일한 시계열이 표시됩니다.")
+    from queries import has_intensity, channel_intensity_timeseries
+    if not has_intensity():
+        st.info("강도 축(K-HATERS 과격도)은 아직 적재 전입니다. "
+                "`model_khaters_v1` run이 적재되면 여기에 과격도 시계열이 표시됩니다.")
+    else:
+        with center_spinner():
+            its = channel_intensity_timeseries(outlet, ctype=ctype).sort_values("wk")
+        if its.empty:
+            st.warning("이 채널의 강도 시계열 데이터가 없습니다.")
+        else:
+            wmean = (its["intensity"] * its["comments"]).sum() / its["comments"].sum()
+            mi1, mi2 = st.columns(2)
+            mi1.metric("평균 과격도", f"{wmean:.3f}", help="0=온건 ~ 1=과격 (댓글 수 가중)")
+            mi2.metric("댓글 수", f"{int(its['comments'].sum()):,}")
+            span_i = st.slider("EMA span (일)", 3, 30, 14, key="int_span")
+            its["ema"] = its["intensity"].ewm(span=span_i).mean()
+
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                                row_heights=[0.72, 0.28])
+            # trace 순서 고정: 0 원시 · 1 EMA · 2 댓글막대 (성향 탭과 같은 원시/EMA/둘다 버튼 패턴)
+            fig.add_trace(go.Scatter(
+                x=its["wk"], y=its["intensity"], name="과격도 (원시)", mode="lines",
+                line=dict(color=COLORS["warn"], width=1.3), opacity=0.5,
+                hovertemplate="%{x|%m-%d} · %{y:.3f}<extra>원시</extra>"), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=its["wk"], y=its["ema"], name="과격도 (EMA)", mode="lines",
+                line=dict(color=COLORS["warn"], width=2.8),
+                hovertemplate="%{x|%m-%d} · %{y:.3f}<extra>EMA</extra>"), row=1, col=1)
+            fig.add_trace(go.Bar(
+                x=its["wk"], y=its["comments"], name="댓글 수", marker_color=COLORS["ink_muted"],
+                customdata=its["videos"],
+                hovertemplate="%{x|%m-%d} · 댓글 %{y:,} · 영상 %{customdata}<extra></extra>"),
+                row=2, col=1)
+
+            def btn_i(label, vis, op, lw):
+                return dict(label=label, method="update",
+                            args=[{"visible": vis, "opacity": op, "line.width": lw}])
+            fig.update_layout(
+                updatemenus=[dict(
+                    type="buttons", direction="right", showactive=True, active=1,
+                    x=0, xanchor="left", y=1.18, yanchor="top",
+                    pad=dict(r=4, t=2), bgcolor=COLORS["surface"], bordercolor=COLORS["border"],
+                    font=dict(color=COLORS["ink"]),
+                    buttons=[
+                        btn_i("원시", [True, False, True], [1, 1, 1], [2.6, 2.8, None]),
+                        btn_i("EMA", [False, True, True], [1, 1, 1], [1.3, 2.8, None]),
+                        btn_i("둘 다", [True, True, True], [0.5, 1, 1], [1.3, 2.8, None]),
+                    ])],
+                template="plotly_dark", height=520, margin=dict(l=10, r=10, t=54, b=10),
+                paper_bgcolor=COLORS["canvas"], plot_bgcolor=COLORS["canvas"],
+                legend=dict(orientation="h", y=1.12, x=0.18), hovermode="x unified", bargap=0.3)
+            fig.update_yaxes(title_text="과격도", row=1, col=1, gridcolor=COLORS["surface"], range=[0, 1])
+            fig.update_yaxes(title_text="댓글", row=2, col=1, gridcolor=COLORS["surface"])
+            fig.update_xaxes(gridcolor=COLORS["surface"], row=2, col=1)
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("과격도 = K-HATERS 4단계(정상<공격<혐오L1<혐오L2)의 기대 서열/3 (0~1). "
+                       "높을수록 과격. 세로=일별 평균 과격도, 하단=일별 댓글 수(hover에 영상 수).")

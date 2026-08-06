@@ -33,17 +33,65 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("뉴스 채널 정치 성향")
-st.caption("YouTube 댓글 분류(KcELECTRA v2). 음수=진보 · 양수=보수 · 아직 분류 안 된 신규 댓글은 제외. 채널 카드를 누르면 상세 통계로 이동합니다.")
-
 with st.sidebar:
     st.subheader("필터")
     ctype_label = st.radio("채널 종류", ["전체", "뉴스(news)", "시사(opinion)"], index=0)
     ctype = {"전체": None, "뉴스(news)": "news", "시사(opinion)": "opinion"}[ctype_label]
-    axis_label = st.radio("축", ["성향 (leaning)", "강도 (준비중)"], index=0,
-                          help="강도 축은 K-HATERS 모델 도입 후 활성화됩니다.")
-    if axis_label.startswith("강도"):
-        st.info("강도 축은 준비 중 — 성향 축을 표시합니다.")
+    axis_label = st.radio("축", ["성향 (leaning)", "강도 (intensity)"], index=0)
+    axis = "intensity" if axis_label.startswith("강도") else "leaning"
+
+
+def _logo(row):
+    return (f'<img class="ch-logo" src="{row["thumb"]}"/>' if row["thumb"]
+            else '<div class="ch-logo"></div>')
+
+
+# ── 강도 축 대시보드 (과격도) ─────────────────────────────────────
+if axis == "intensity":
+    from queries import has_intensity, channel_intensity_summary
+    if not has_intensity():
+        st.title("채널 댓글 과격도 (준비중)")
+        st.info("강도 축(K-HATERS 과격도)은 아직 적재 전입니다. "
+                "`model_khaters_v1` run이 적재되면 채널별 과격도가 표시됩니다.")
+        st.stop()
+    st.title("뉴스 채널 댓글 과격도")
+    st.caption("K-HATERS 과격도(0=온건 ~ 1=과격, 높을수록 과격). 성향과 독립된 축 — "
+               "'성향은 중도인데 과격한 채널'을 드러냅니다. 채널을 누르면 상세로 이동합니다.")
+    with center_spinner():
+        di = channel_intensity_summary(ctype=ctype)
+    if di.empty:
+        st.warning("표시할 데이터가 없습니다."); st.stop()
+    di = di.sort_values("intensity", ascending=False)
+    tot = di["total"].sum()
+    ov = (di["intensity"] * di["total"]).sum() / tot if tot else 0
+    k1, k2, k3 = st.columns(3)
+    k1.metric("전체 평균 과격도", f"{ov:.3f}")
+    k2.metric("최과격 채널", di.iloc[0]["outlet"], f"{di.iloc[0]['intensity']:.3f}")
+    k3.metric("최온건 채널", di.iloc[-1]["outlet"], f"{di.iloc[-1]['intensity']:.3f}")
+    st.divider()
+    st.subheader("채널별 과격도")
+
+    def card_i(row):
+        pct = float(row["intensity"]) * 100
+        bar = (f'<div class="ch-bar" style="background:linear-gradient(90deg,'
+               f'{COLORS["warn"]} {pct:.1f}%,{COLORS["surface"]} {pct:.1f}%)"></div>')
+        return (
+            f'<a class="ch-card" href="/channel-stats?outlet={quote(str(row["outlet"]))}" target="_self">'
+            f'{_logo(row)}'
+            f'<div class="ch-name">{row["outlet"]}'
+            f'<div class="ch-sub">{CONVENTION.get(row["outlet"], "—")} · 표본 {int(row["total"]):,}</div></div>'
+            f'{bar}'
+            f'<div class="ch-meta"><span class="ch-score">{row["intensity"]:.3f}</span>'
+            f'<div class="ch-sub">과격도</div></div></a>'
+        )
+    st.markdown('<div class="ch-list">' + "".join(card_i(r) for _, r in di.iterrows()) + "</div>",
+                unsafe_allow_html=True)
+    st.stop()
+
+
+# ── 성향 축 대시보드 (기본) ──────────────────────────────────────
+st.title("뉴스 채널 정치 성향")
+st.caption("YouTube 댓글 분류(KcELECTRA v2). 음수=진보 · 양수=보수 · 아직 분류 안 된 신규 댓글은 제외. 채널 카드를 누르면 상세 통계로 이동합니다.")
 
 with center_spinner():
     df = channel_summary(axis="leaning", ctype=ctype)
