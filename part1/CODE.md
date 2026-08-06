@@ -21,14 +21,14 @@ part1/
 ## 전체 흐름
 
 ```
-YouTube Data API                    Neon PostgreSQL
+YouTube Data API                    CockroachDB Cloud (운영 DB)
       │                                    ▲
       │  channels → playlistItems          │
       │  → videos(카테고리) → 필터         │
       │  → commentThreads                  │
       ▼                                    │
   Data/collect.py  ──── 적재 ──────────────┘
-      │                        (운영 DB `newstance`에 적재 — DATABASE_URL이 직접 가리킴)
+      │                        (운영 DB에 직접 적재 — DATABASE_URL이 가리키는 CockroachDB)
       ├── Data/keywords.py / keywords.json  (2차 필터: 정치 키워드 판별)
       └── migrate.py / DB_migrations/       (스키마 관리, 공용)
 ```
@@ -45,7 +45,7 @@ YouTube Data API                    Neon PostgreSQL
 - 댓글은 `execute_values`로 **영상당 1회 일괄 삽입**(건당 INSERT 대비 DB 왕복 대폭 절감)
 - `commentsDisabled`(HTTP 403)는 정상 케이스로 스킵하고 `videos.comments_disabled` 플래그 기록
 
-**적재 대상**: `DATABASE_URL`(운영 DB `newstance`)에 직접 적재한다. 1·2차 필터 검증을 마친 뒤, 그동안 쓰던 테스트 DB `collect_test`를 `newstance`로 rename해 운영으로 승격했다(2026-08-03). 예전의 test/운영 분리(`ensure_test_database`)와 공용 `db.py`는 제거됐다.
+**적재 대상**: `DATABASE_URL`이 가리키는 운영 DB에 직접 적재한다. **현재 운영 DB는 CockroachDB Cloud(무료 10GB)** — Neon(0.5GB) 한도 근접으로 2026-08-05 이전했다(경위·접속(verify-full+CA인증서)은 [Part1.md](Part1.md) §3). 그 전엔 Neon `newstance`였고(테스트 DB `collect_test`를 rename 승격, 08-04), 이때 test/운영 분리(`ensure_test_database`)와 공용 `db.py`가 제거돼 모든 스크립트가 `DATABASE_URL`에 직접 연결한다.
 
 ### `keywords.json` — 정치 키워드 데이터
 2차 필터가 쓰는 키워드를 코드와 분리해 데이터로 관리(정치인·정당명은 시간이 지나면 낡아지므로 갱신이 잦음).
@@ -76,7 +76,7 @@ YouTube Data API                    Neon PostgreSQL
 - `DB_migrations/0009_channel_thumbnail.sql`: `channels.thumbnail_url` 추가 — 시각화 대시보드의 채널 카드 로고용. `channels.list`(snippet.thumbnails)로 13개 채널 1회 수집
 - `migrate.py`: 아직 적용 안 된 `.sql` 파일만 순서대로 실행하고 `schema_migrations` 테이블에 이력 기록
 - **스키마를 바꿀 땐 기존 파일을 수정하지 말고 `0002_xxx.sql` 같은 새 파일을 추가할 것** (기존 파일 수정 시 이미 적용된 DB와 어긋남)
-- 실행: `python migrate.py` — `DATABASE_URL`(운영 DB `newstance`) 대상. 각 수집·학습 스크립트도 실행 시 같은 DB에 직접 연결한다.
+- 실행: `python migrate.py` — `DATABASE_URL`(현재 CockroachDB) 대상. 각 수집·학습 스크립트도 실행 시 같은 DB에 직접 연결한다. (CockroachDB엔 최종 상태 스키마를 직접 생성하고 0001~0009를 기록해둬서 at-head 상태다 — Part1.md §3.)
 
 ### `backfill.py` — 과거 영상 소급 수집
 매일 24시간치만 모으는 `collect.py`와 달리 **더 과거로** 소급 수집하는 도구. 상시 실행하지 않고, 하루 남은 쿼터에 맞춰 수동으로 돌린다.
@@ -127,7 +127,7 @@ YouTube Data API                    Neon PostgreSQL
 ### `infer.py` — 전체 댓글 추론·적재 (Part 1 결론 단계)
 학습된 모델을 전체 댓글에 적용해 채널별 성향 점수를 낸다. 개별 정확도가 아니라 **채널 순위가 통념과 맞는가**가 목적이다(수만 건 평균이라 개별 오차는 상쇄된다).
 
-- **Neon 접근은 앞뒤 한 번씩만** — 시작에 댓글을 fetch → GPU로 전부 추론 → 완료 후 `comment_labels`에 청크 배치 UPSERT(추론 중에는 DB 미접근). label=argmax, score=P(우)−P(좌), confidence=max prob.
+- **원격 DB 접근은 앞뒤 한 번씩만** — 시작에 댓글을 fetch → GPU로 전부 추론 → 완료 후 `comment_labels`에 청크 배치 UPSERT(추론 중에는 DB 미접근). label=argmax, score=P(우)−P(좌), confidence=max prob.
 - **2축 확장 대비** — 축별 후처리를 `AXIS_CONFIG`로 분리했다. `leaning`(기본)만 구현돼 있고, 강도 축(K-HATERS)은 후처리 함수 하나만 추가하면 `--axis intensity`로 붙는다.
 - 기본 모델 `models/kcelectra_v2`, run_id `model_kcelectra_v2`. `results/<run_id>.txt`(채널 순위·분포)와 `.progress`(진행률)를 로컬에도 남긴다(`results/`는 gitignore).
 
@@ -149,7 +149,7 @@ YouTube Data API                    Neon PostgreSQL
 | `app.py` | 진입점. `st.navigation` 멀티페이지(대시보드·채널 별 통계·채널 비교) + 공용 폰트(Pretendard)/배경 CSS. ⚠️ `font-family:*` 전역 지정이 material 아이콘 폰트를 덮어 아이콘이 글자로 새므로 아이콘 폰트를 명시 복원한다. 기본 우상단 실행 인디케이터는 숨기고 중앙 원형 스피너로 대체 |
 | `views/dashboard.py` | 채널 행(HTML 카드: 로고+이름 밀착, 카드 전체 클릭 시 `?outlet=`로 상세 이동) + 좌\|중립\|우 3색 그라데이션 바(중립 저채도). ⚠️ `st.image(...) if x else ...` 삼항은 Streamlit magic으로 화면에 새어 나가므로 if/else 문으로 쓴다 |
 | `views/channel_stats.py` | 채널 일별 좌%·우% 시계열. 원시/EMA 전환은 **plotly updatemenus 버튼(클라이언트)** — Streamlit 위젯이면 매번 서버 rerun이라 전환이 뚝뚝 끊긴다. 하단 x축 공유 댓글 수 막대(영상 수 hover). 강도 탭은 자리만 |
-| `views/compare.py` | 채널별 '판정 중 우비율' EMA를 한 그래프에 채널 브랜드색으로 겹침 + 50% 균형선 |
+| `views/compare.py` | 채널별 '판정 중 우비율' EMA를 한 그래프에 채널 브랜드색으로 겹침 + 50% 균형선. **X축은 선택 채널의 공통 기간(교집합)으로 트림** — 채널마다 소급 깊이가 달라도 공정 비교(EMA는 전체 이력으로 계산 후 보기만 자름). 개별 채널 전체 깊이는 `channel_stats.py`에서 |
 | `queries.py` | DB 집계(모두 `@st.cache_data`). **미분류 배제가 여기 박혀 있다** — `comment_labels`(run=`model_kcelectra_v2`)와 inner join이라 collect.py가 지금 쌓는 미추론 신규 댓글은 자동 제외(`unusable` 제외, `neutral` 포함). `RUN_BY_AXIS`로 축→run_id 매핑(강도 축 대비) |
 | `theme.py` | Sentry 다크 팔레트(`COLORS`)·채널 브랜드색(`CHANNEL_COLORS`)·성향 관례(`CONVENTION`) |
 | `util.py` | `center_spinner()` — 화면 중앙 원형 로딩 스피너 컨텍스트매니저 |
@@ -164,8 +164,8 @@ YouTube Data API                    Neon PostgreSQL
 cd part1
 pip install -r requirements.txt
 
-python migrate.py     # 스키마 생성/갱신 (운영 DB newstance 대상)
-python Data/collect.py     # 24시간치 수집 (운영 DB newstance에 적재)
+python migrate.py     # 스키마 생성/갱신 (운영 DB = CockroachDB, DATABASE_URL 대상)
+python Data/collect.py     # 24시간치 수집 (운영 DB에 적재)
 python Data/backfill.py     # 과거 소급 수집 (필요할 때만, TOTAL_BUDGET 확인 후)
 python Data/prune.py --dry-run    # 하한선보다 오래된 데이터 확인 (--yes로 실제 삭제)
 

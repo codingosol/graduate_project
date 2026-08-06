@@ -1,20 +1,16 @@
 name: daily-collect
 
-# 매일 자동으로 도는 것은 "수집 + 필터 + 저장"까지다.
-#   channels.list → playlistItems.list → 1차 필터(categoryId=25) → 2차 필터(제목 키워드)
-#   → commentThreads.list → Neon 적재
+# 매일 도는 것은 "수집 + 필터 + 저장"까지다.
+#   collect.py : 최근 24시간 신규 정치영상·댓글 수집 (우선)
+#   backfill.py: 남은 쿼터로 과거를 하한선(prune.RETENTION_FLOOR = 2025-08-01)까지 소급 수집
+#   → CockroachDB 적재 (DATABASE_URL)
 #
-# 좌/우/중립/사용불가 성향 분류는 이 워크플로우에 넣지 않는다.
-#   - 학습은 로컬 GPU(러너엔 GPU 없음), 추론도 로컬 배치로 별도 수행한다.
-#   - 즉 이 CI는 "원본 댓글을 계속 쌓기만" 하고, 분류는 나중에 따로 돌린다.
-#   (근거: DECISIONS.md 2026-07-20 "학습·추론 실행 위치")
+# 좌/우/중립/불가 성향 분류는 이 워크플로에 넣지 않는다(학습·추론은 로컬 GPU 배치).
+#   근거: DECISIONS.md 2026-07-20 "학습·추론 실행 위치".
 
 on:
-  # ⏸ 일일 자동 수집 일시 중단(2026-08-05). Neon 무료 티어(512MB) 용량 확보 및 강도 축
-  #   도입을 정리하는 동안 데이터가 계속 늘지 않게 스케줄을 껐다. 재개하려면 아래 주석을 되살린다.
-  #   (성향 축 분석 코퍼스는 2026-04-21~08-02로 이미 고정·완결 상태)
-  # schedule:
-  #   - cron: '0 18 * * *'   # 매일 UTC 18:00 = KST 03:00. 실행 시점 기준 최근 24시간을 수집
+  schedule:
+    - cron: '0 18 * * *'   # 매일 UTC 18:00 = KST 03:00. 실행 시점 기준 최근 24시간 수집
   workflow_dispatch:        # 필요 시 수동 실행
 
 # 이전 실행이 아직 돌고 있으면 겹쳐 돌리지 않는다(중복 수집·쿼터 낭비 방지)
@@ -25,7 +21,7 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 30     # 수집은 보통 수십 초~수 분. 매달려 쿼터/시간을 태우지 않도록 상한
+    timeout-minutes: 40     # collect 수십 초 + backfill 최대 ~8분. 여유 있게 상한
     defaults:
       run:
         working-directory: part1
@@ -41,11 +37,30 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Collect (24h window -> filter -> store)
-        run: python Data/collect.py
+      # CockroachDB는 sslmode=verify-full 접속이라 러너에 CA 인증서가 필요하다.
+      # libpq가 자동으로 찾는 위치(~/.postgresql/root.crt)에 클러스터 공개 CA 인증서를 받는다.
+      - name: Download CockroachDB CA cert
+        run: |
+          mkdir -p ~/.postgresql
+          curl -fsSL -o ~/.postgresql/root.crt \
+            https://cockroachlabs.cloud/clusters/6c61acba-fd2e-4673-918a-749064f3f307/cert
+
+      # collect.py를 먼저 돌려 그날 신규분을 확보하고(우선), 소모한 쿼터를 QUOTA_SPENT로 파싱해
+      # 하루 쿼터(10,000)에서 안전여유(500)를 뺀 나머지를 backfill --budget 으로 넘긴다.
+      # 남은 쿼터가 1,000 미만이면 backfill은 건너뛴다(다음 날 이어서 소급).
+      - name: Collect (priority) then backfill with remaining quota
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          # collect.py는 DATABASE_URL이 가리키는 운영 DB(newstance)에 직접 적재한다(2026-08-04 전환).
-          # ⚠️ GitHub Secrets의 DATABASE_URL이 /newstance를 가리키는지 확인할 것
-          #    (구 /neondb를 가리키면 빈 DB로 새어 나간다). 스케줄 재개 전 필수 점검.
+        run: |
+          set -o pipefail
+          python Data/collect.py | tee collect.out
+          SPENT=$(grep -oP 'QUOTA_SPENT=\K[0-9]+' collect.out | tail -1)
+          SPENT=${SPENT:-0}
+          REMAINING=$((10000 - SPENT - 500))
+          echo "collect 사용 ${SPENT} unit → backfill 예산 ${REMAINING} unit"
+          if [ "$REMAINING" -ge 1000 ]; then
+            python Data/backfill.py --budget "$REMAINING"
+          else
+            echo "남은 쿼터 부족(${REMAINING}) → backfill 생략(다음 실행에서 이어서 소급)"
+          fi

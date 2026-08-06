@@ -433,7 +433,7 @@ def main():
 
     # minconn = maxconn으로 둔다. psycopg2의 putconn은 보유 연결이 minconn 이상이면 반납된 연결을
     # 보관하지 않고 close()하므로, minconn이 작으면 매번 새 연결을 만들게 된다
-    # (Neon까지 새 연결 생성에 평균 1.7초 — collect.py에서 최대 병목이었음).
+    # (원격 DB까지 새 연결 생성에 시간이 걸림 — collect.py에서 최대 병목이었음).
     pool_size = CHANNEL_WORKERS + 4
     db_pool = ThreadedConnectionPool(pool_size, pool_size, database_url)
 

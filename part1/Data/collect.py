@@ -34,7 +34,7 @@ MAX_LOOKBACK = timedelta(days=7)       # 재개 구간 상한. 이보다 벌어�
 CHANNEL_WORKERS = 5  # 1단계: 채널별 메타데이터/영상목록 조회 동시 실행 수
 VIDEO_WORKERS = 10  # 2단계: 영상별 댓글 조회 동시 실행 수
 DB_POOL_SIZE = VIDEO_WORKERS + 4  # ThreadedConnectionPool은 풀이 바닥나면 대기 없이 바로 예외를 던지므로,
-# 동시 작업자 수(VIDEO_WORKERS)보다 넉넉하게 잡아야 함. Neon 무료 티어 direct 한도(~100)엔 충분히 여유 있음.
+# 동시 작업자 수(VIDEO_WORKERS)보다 넉넉하게 잡아야 함. 운영 DB(CockroachDB) 연결 한도엔 충분히 여유 있음.
 
 # outlet_name -> [(key_type, key_value, channel_type), ...]
 # key_type: "handle"(@핸들) | "id"(채널ID) | "username"(레거시 /user/ 이름)
@@ -98,12 +98,14 @@ def fetch_channel(youtube, key_type, key_value):
     elif key_type == "id":
         kwargs["id"] = key_value
     resp = youtube.channels().list(**kwargs).execute()
+    QUOTA.spend()
     items = resp.get("items", [])
     return items[0] if items else None
 
 
 def fetch_category_names(youtube, region_code="KR"):
     resp = youtube.videoCategories().list(part="snippet", regionCode=region_code).execute()
+    QUOTA.spend()
     return {item["id"]: item["snippet"]["title"] for item in resp.get("items", [])}
 
 
@@ -118,6 +120,7 @@ def fetch_recent_videos(youtube, uploads_playlist_id, cutoff):
             maxResults=50,
             pageToken=page_token,
         ).execute()
+        QUOTA.spend()
 
         stop = False
         for item in resp.get("items", []):
@@ -141,6 +144,7 @@ def fetch_video_categories(youtube, video_ids):
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i : i + 50]
         resp = youtube.videos().list(part="snippet", id=",".join(batch)).execute()
+        QUOTA.spend()
         for item in resp.get("items", []):
             categories[item["id"]] = item["snippet"].get("categoryId")
     return categories
@@ -275,6 +279,7 @@ def fetch_top_comments(youtube, video_id, max_results=100):
         resp = youtube.commentThreads().list(
             part="snippet", videoId=video_id, order="relevance", maxResults=max_results
         ).execute()
+        QUOTA.spend()
     except HttpError as e:
         reason = json.loads(e.content)["error"]["errors"][0]["reason"]
         return None, reason
@@ -368,6 +373,23 @@ class Timings:
 TIMINGS = Timings()
 
 
+class QuotaCounter:
+    """YouTube API 소모 쿼터 누적(스레드 안전). 이 스크립트가 쓰는 list.execute() 엔드포인트
+    (channels/videoCategories/playlistItems/videos/commentThreads)는 전부 호출당 1 unit이라
+    호출 수 = 소모 unit이다. GitHub Actions에서 backfill에 넘길 '남은 쿼터' 계산에 쓴다."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.units = 0
+
+    def spend(self, n=1):
+        with self._lock:
+            self.units += n
+
+
+QUOTA = QuotaCounter()
+
+
 def process_video(api_key, db_pool, channel_id, item, category_id, category_name):
     """2단계 작업 (스레드에서 실행): 영상 1건의 댓글 수집 + DB 저장(영상 1행 + 댓글 일괄 삽입)."""
     video_id = item["snippet"]["resourceId"]["videoId"]
@@ -445,7 +467,7 @@ def main():
     if not api_key or not database_url:
         raise SystemExit("YOUTUBE_API_KEY / DATABASE_URL 환경변수가 필요합니다.")
 
-    print("=== 테스트 DB 준비 (운영 DB에는 적재하지 않음) ===")
+    print("=== 일일 수집 시작 (운영 DB = DATABASE_URL) ===")
 
     bootstrap_youtube = make_youtube_client(api_key)
     category_names = fetch_category_names(bootstrap_youtube)
@@ -455,7 +477,7 @@ def main():
 
     # minconn을 작업자 수만큼 잡아야 한다. psycopg2의 putconn은 풀 보유 연결이 minconn 이상이면
     # 반납된 연결을 보관하지 않고 그냥 close()해버린다. minconn=1이면 연결 1개만 남고 나머지는
-    # 매번 새로 만들게 되는데, Neon(싱가포르)까지 새 연결을 여는 데 평균 1.7초가 들어
+    # 매번 새로 만들게 되는데, 원격 DB(싱가포르 리전)까지 새 연결을 여는 데 시간이 들어
     # 이것이 전체 실행시간의 최대 병목이었다(계측: getconn 1,682ms vs API 139ms).
     db_pool = ThreadedConnectionPool(DB_POOL_SIZE, DB_POOL_SIZE, database_url)
 
@@ -552,7 +574,9 @@ def main():
     elapsed = time.perf_counter() - start_time
     print(f"\n[단계별] 1단계(채널/영상목록) {stage1_elapsed:.1f}초 / 2단계(댓글수집) {stage2_elapsed:.1f}초")
     TIMINGS.report(stage2_elapsed, VIDEO_WORKERS)
-    print(f"\n=== 완료: newstance(운영) DB에 저장됨 — 총 소요시간 {elapsed:.1f}초 ===")
+    print(f"\n=== 완료: 운영 DB에 저장됨 — 총 소요시간 {elapsed:.1f}초 ===")
+    # GitHub Actions가 파싱해 backfill에 넘길 '남은 쿼터'를 계산한다(마지막 줄, 고정 형식).
+    print(f"QUOTA_SPENT={QUOTA.units}")
 
 if __name__ == "__main__":
     main()
