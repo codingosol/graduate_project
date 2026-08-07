@@ -52,7 +52,7 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 
 - 카테고리: `parties`(정당명) / `institutions_terms`(기구·용어) / `hanja_abbreviations`(한자 축약 與野檢李尹) / `nicknames`(별칭 잼통·잼프) / `politician_names`(정치인) + `exclude_foreign_leaders`(해외 정상 제외 목록)
 - **판정에서 카테고리가 두 갈래로 쓰인다** — `parties`·`hanja_abbreviations`·`nicknames`·`politician_names`(143개)는 **국내 고유**, `institutions_terms`(79개)는 **일반 용어**. 아래 `keywords.py` 참고
-- 현재 포함 222개 / 제외 10개
+- 현재 포함 241개 / 제외 12개 (2026-08-07 감사로 최근 정치인 19명 추가 — 경위 `_comment`·`../DECISIONS.md` 08-07)
 - `_comment` 필드에 **오탐으로 확인돼 의도적으로 뺀 키워드**를 기록해둠(검찰·제헌절·정당·당원·군수·시의원·정부·민심·여야) — 나중에 "이거 왜 없지?" 하고 다시 넣는 실수를 막기 위함
 
 ### `keywords.py` — 키워드 로더
@@ -82,7 +82,8 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 매일 24시간치만 모으는 `collect.py`와 달리 **더 과거로** 소급 수집하는 도구. 상시 실행하지 않고, 하루 남은 쿼터에 맞춰 수동으로 돌린다.
 
 - **채널별 독립 quota + `MAX_PAGES_PER_CHANNEL`(채널당 페이지 상한)** 이중 안전장치 — 전체 공용 예산 하나만 뒀다가 한 채널(오마이TV)이 예산을 독점해버린 사고가 있어서 이렇게 바꿈
-- **예산은 `resolve_targets()`가 실행할 때마다 자동 배분한다**(2026-07-24). `channels.backfill_cursor`로 채널별 남은 일수를 읽어 ①하한 도달 채널은 제외 ②`MIN_CHANNEL_BUDGET`을 깔고 ③남은 예산을 **필요량이 적은 채널부터** 채운다. 손으로 적던 `CHANNEL_BUDGETS` 상수는 완주 채널의 몫이 놀아서(실측 1,758 unit) 폐기했다. '가까운 채널부터'인 이유는 `playlistItems`가 날짜 점프를 못 해 **매 실행마다 커서까지 다시 페이지를 넘겨야** 하고, 채널을 빨리 끝낼수록 그 반복 비용이 사라지기 때문 (시뮬레이션: 완주까지 2일 vs 균등 배분 3일)
+- **예산은 `resolve_targets()`가 실행할 때마다 자동 배분한다**(2026-07-24, 배분식 08-07 개정). `channels.backfill_cursor`로 채널별 남은 일수를 읽어 ①하한 도달·exhausted 채널 제외 ②need(=통과비용+소급비용) 적은 순으로 **완주 임박 채널에 예산을 몰아준다**. '가까운 채널부터'인 이유는 `playlistItems`가 날짜 점프를 못 해 **매 실행마다 커서까지 다시 페이지를 넘겨야**(통과 비용) 하고, 채널을 빨리 끝낼수록 그 반복 비용이 사라지기 때문.
+  - ⚠️ **08-07 개정 — MIN 살포 폐기, 몰아주기.** 이전엔 MIN_CHANNEL_BUDGET(300)을 전 채널에 깔았는데, need(≈2.4만)가 하루 예산(≈8천)보다 훨씬 큰 상황(커서 깊은 채널)에선 대부분이 **통과 비용(고빈도 채널 ~540)에도 못 미쳐 커서에 닿지도 못하고 300씩 헛씀**(실측 로그: 신규0/훑음0). 그래서 need 적은 순으로 몰아주되 **통과 비용조차 못 받을 채널은 0으로 건너뛴다**. 한 채널을 완주/exhausted시켜 다음부터 그 통과 비용을 없애는 게 최선(경위 `../DECISIONS.md` 08-07).
 - **필요량(`need`)은 통과 비용 + 소급 비용**이다(2026-07-25). 커서까지 다시 넘기는 `days_since_cursor × PASS_UNITS_PER_DAY`와 커서 아래로 내려가는 `days_left × UNITS_PER_DAY`의 합. 통과 비용을 빼먹으면 커서 깊은 채널(YTN, 커서 92일 전)이 남은 일수가 적다는 이유로 최소 예산만 받아 **커서에 닿지도 못하고 끝난다**(실측: 300 unit으로 훑음 0건).
 - `TOTAL_BUDGET`(7,920)만 조정하면 되고, `EXCLUDED_OUTLETS`는 이미 충분히 모인 채널을 제외
 - 재개 지점은 `channels.backfill_cursor`(실제로 훑은 가장 오래된 지점). `MIN(published_at)`을 쓰면 정치 영상이 없는 구간을 훑고도 커서가 안 움직여 매일 같은 구간을 다시 훑게 됨

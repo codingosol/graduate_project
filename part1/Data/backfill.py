@@ -168,9 +168,11 @@ def resolve_targets(conn, total_budget=TOTAL_BUDGET):
                 continue  # 이미 하한 도달 — 예산을 주지 않는다
             if exhausted:
                 continue  # 재생목록 물리 한계 도달(YTN·연합) — 더 백필해도 헛돈다
-            # 필요량 = 커서까지 다시 넘기는 통과 비용 + 커서 아래로 더 내려가는 소급 비용.
-            # 통과 비용을 빼먹으면 커서 깊은 채널(YTN)이 최소 예산만 받아 커서에 닿지도 못한다.
-            need = since_cursor * PASS_UNITS_PER_DAY + left * UNITS_PER_DAY
+            # 통과 비용 = 커서까지 다시 페이지를 넘겨 '재도달'하는 비용(playlistItems는 실행마다
+            # 최신부터 다시 훑어야 함 — 날짜 점프·토큰 재개 불가). 이 비용도 못 받으면 커서에
+            # 닿지도 못하고 예산만 태운다(실측: 300 unit으로 훑음 0). 필요량 = 통과 + 소급.
+            pass_cost = since_cursor * PASS_UNITS_PER_DAY
+            need = pass_cost + left * UNITS_PER_DAY
             active.append(
                 {
                     "outlet_name": outlet_name,
@@ -178,6 +180,7 @@ def resolve_targets(conn, total_budget=TOTAL_BUDGET):
                     "key_value": key_value,
                     "channel_type": channel_type,
                     "days_left": left,
+                    "pass_cost": pass_cost,
                     "need": max(MIN_CHANNEL_BUDGET, need),
                 }
             )
@@ -185,20 +188,22 @@ def resolve_targets(conn, total_budget=TOTAL_BUDGET):
     if not active:
         return []
 
-    # 1) 최소 예산을 모두에게 깔고, 2) 남은 것을 필요량이 적은 순서로 채운다.
-    base = min(MIN_CHANNEL_BUDGET, total_budget // len(active))
+    # need(≈2만+)가 하루 예산(≈8천)보다 훨씬 큰 경우가 흔하다(커서 깊은 채널). 이때 예산을
+    # 모든 채널에 조금씩 흩뿌리면 대부분이 통과 비용에도 못 미쳐 전부 헛돈다. 대신 **필요량이
+    # 적은(완주에 가까운) 채널부터 몰아주고**, 이번 실행에 통과 비용조차 못 받는 채널은 0으로
+    # 건너뛴다(다음 실행에서 순번이 온다). 한 채널을 완주/exhausted시키면 그 채널의 통과 비용이
+    # 다음부터 통째로 사라져 전체가 빨리 끝난다.
+    remaining = total_budget
     for t in active:
-        t["budget"] = base
-    remaining = total_budget - base * len(active)
+        t["budget"] = 0
     for t in sorted(active, key=lambda x: x["need"]):
-        if remaining <= 0:
-            break
-        top_up = min(t["need"] - t["budget"], remaining)
-        if top_up > 0:
-            t["budget"] += top_up
-            remaining -= top_up
+        if remaining < t["pass_cost"]:
+            continue  # 커서 재도달 비용도 못 줌 → 이번 실행엔 진전 불가, 건너뜀
+        give = min(t["need"], remaining)
+        t["budget"] = give
+        remaining -= give
 
-    return active
+    return [t for t in active if t["budget"] > 0]
 
 
 def backfill_channel(api_key, db_pool, target):
