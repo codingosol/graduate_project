@@ -64,17 +64,29 @@ def _postprocess_leaning(prob):
     conf = prob.max(axis=1).astype(np.float32)
     return labels, scores, conf
 
+
+def _postprocess_intensity(prob):
+    """강도 축(K-HATERS). 클래스 순서 normal<offensive<L1_hate<L2_hate (train_intensity.py와 동일).
+    label은 없고(NULL), score = **기대 서열 / 3 = 0~1 과격도**. confidence = max 확률."""
+    n, k = prob.shape                                  # k=4
+    ranks = np.arange(k, dtype=np.float32)             # [0,1,2,3]
+    scores = ((prob * ranks).sum(axis=1) / (k - 1)).astype(np.float32)  # 0~1
+    conf = prob.max(axis=1).astype(np.float32)
+    labels = np.array([None] * n, dtype=object)        # 강도 축은 이산 라벨을 쓰지 않는다
+    return labels, scores, conf
+
+
 AXIS_CONFIG = {
     "leaning": {
         "post": _postprocess_leaning,
         "default_model": os.path.join(os.path.dirname(__file__), "..", "..", "models", "kcelectra_v2"),
         "default_run": "model_kcelectra_v2",
     },
-    # "intensity": {  # 강도 축 도입(K-HATERS) 시 여기에 후처리·기본 모델·run_id를 추가.
-    #     "post": _postprocess_intensity,   # label=None, score=과격도(0~1)
-    #     "default_model": ".../models/khaters_v1",
-    #     "default_run": "model_khaters_v1",
-    # },
+    "intensity": {
+        "post": _postprocess_intensity,
+        "default_model": os.path.join(os.path.dirname(__file__), "..", "..", "models", "khaters_v1"),
+        "default_run": "model_khaters_v1",
+    },
 }
 
 
@@ -97,22 +109,34 @@ def progress_writer(run_id, total):
 
 @torch.no_grad()
 def run_inference(model, tokenizer, texts, batch, device, post, progress_cb):
-    """배치 추론 → 축별 후처리 결과(label, score, confidence)를 numpy로 모은다."""
-    labels, scores, confs = [], [], []
+    """배치 추론 → 축별 후처리 결과(label, score, confidence)를 numpy로 모은다.
+
+    **길이순 버킷팅**: 텍스트를 길이순으로 정렬해 비슷한 길이끼리 한 배치에 넣는다. padding은
+    배치 내 최댓값까지 채워지는데, 무작위 순서면 짧은 댓글이 긴 댓글 하나 때문에 통째로 패딩돼
+    GPU가 헛일을 한다(댓글 길이 편차가 큼). 정렬하면 패딩이 최소화돼 추론이 빨라진다.
+    결과는 원래 순서로 되돌려 반환하므로 ids/like 등과의 정렬이 유지된다(수치도 동일)."""
     n = len(texts)
-    for i in range(0, n, batch):
-        enc = tokenizer(texts[i : i + batch], truncation=True, max_length=MAX_LEN,
+    order = sorted(range(n), key=lambda i: len(texts[i]))   # 길이순 인덱스
+    labels = np.empty(n, dtype=object)
+    scores = np.empty(n, dtype=np.float32)
+    confs = np.empty(n, dtype=np.float32)
+    done = 0
+    for b in range(0, n, batch):
+        idx = order[b : b + batch]
+        enc = tokenizer([texts[i] for i in idx], truncation=True, max_length=MAX_LEN,
                         padding=True, return_tensors="pt")
         enc = {k: v.to(device) for k, v in enc.items()}
         with torch.autocast("cuda", dtype=torch.float16, enabled=device == "cuda"):
             logits = model(**enc).logits
         prob = torch.softmax(logits.float(), dim=-1).cpu().numpy()
         l, s, c = post(prob)
-        labels.append(l); scores.append(s); confs.append(c)
-        if (i // batch) % 100 == 0:
-            progress_cb(min(i + batch, n))
+        for j, i in enumerate(idx):     # 원위치로 되돌려 저장
+            labels[i], scores[i], confs[i] = l[j], s[j], c[j]
+        done += len(idx)
+        if (b // batch) % 100 == 0:
+            progress_cb(done)
     progress_cb(n)
-    return np.concatenate(labels), np.concatenate(scores), np.concatenate(confs)
+    return labels, scores, confs
 
 
 def save_to_db(conn, run_id, axis, model_name, ids, labels, scores, confs):
@@ -150,26 +174,83 @@ def save_to_db(conn, run_id, axis, model_name, ids, labels, scores, confs):
         print(f"  DB 적재 {min(i + DB_CHUNK, len(rows)):,}/{len(rows):,}", flush=True)
 
 
-def ranking_text(df, title, only_type=None):
-    """채널별 성향 순위를 문자열로 만든다(화면·파일 공용). intensity 축엔 호출하지 않는다."""
-    d = df if only_type is None else df[df.ctype == only_type]
-    pol = d[d.label != "unusable"].copy()
-    if pol.empty:
-        return ""
+def _agg_from_rows(rows, labels, scores):
+    """--no-db 경로: 방금 추론한 것만으로 채널별 합계 집계(전체 run이 아니라 이번 배치)."""
+    df = pd.DataFrame({
+        "outlet": [r[2] for r in rows], "ctype": [r[3] for r in rows],
+        "like": np.array([r[4] for r in rows], dtype=np.int64),
+        "label": labels, "score": scores,
+    })
+    pol = df[df["label"] != "unusable"].copy()
     pol["w"] = np.log1p(pol["like"].clip(lower=0))
     pol["sw"] = pol["score"] * pol["w"]
-    key = ["outlet", "ctype"] if only_type is None else ["outlet"]
-    g = pol.groupby(key).agg(n=("score", "size"), mean=("score", "mean"),
-                             sw=("sw", "sum"), w=("w", "sum")).reset_index()
-    g["wmean"] = np.where(g["w"] > 0, g["sw"] / g["w"], g["mean"])
-    g = g.sort_values("mean")
+    agg = pol.groupby(["outlet", "ctype"], as_index=False).agg(
+        n=("score", "size"), s_score=("score", "sum"), s_sw=("sw", "sum"), s_w=("w", "sum"))
+    dist = pd.Series(labels).value_counts().to_dict()
+    return agg, dist
 
-    out = [f"\n{'='*72}\n{title}  (음수=진보 / 양수=보수)",
-           f"  {'채널':<20}{'단순평균':>9}{'좋아요가중':>11}{'통념':>10}{'표본':>9}"]
+
+def fetch_run_aggregates(conn, run_id, axis):
+    """전체 run 기준 채널별 합계를 **SQL에서** 집계한다(증분 추론 후에도 순위가 전체를 반영).
+    60만 행을 파이썬으로 끌어오지 않고 채널 ~13행만 받아 온다.
+    leaning은 unusable(잡음)을 빼고 집계하지만, intensity는 label이 NULL이라 전량 집계한다."""
+    cur = conn.cursor()
+    # ⚠️ NULL <> 'unusable' 는 NULL(거짓)이라 intensity에 이 필터를 걸면 전부 빠진다. axis로 분기.
+    unusable_filter = "AND cl.label <> 'unusable'" if axis == "leaning" else ""
+    cur.execute(f"""
+        SELECT ch.outlet_name, ch.channel_type,
+               count(*)                                                   AS n,
+               sum(cl.score)                                              AS s_score,
+               sum(cl.score * ln((1 + greatest(c.like_count, 0))::float8)) AS s_sw,
+               sum(ln((1 + greatest(c.like_count, 0))::float8))           AS s_w
+        FROM comment_labels cl
+        JOIN comments c  ON c.comment_id = cl.comment_id
+        JOIN videos v    ON v.video_id   = c.video_id
+        JOIN channels ch ON ch.channel_id = v.channel_id
+        WHERE cl.run_id = %s AND v.is_political {unusable_filter}
+        GROUP BY ch.outlet_name, ch.channel_type
+    """, (run_id,))
+    agg = pd.DataFrame(cur.fetchall(),
+                       columns=["outlet", "ctype", "n", "s_score", "s_sw", "s_w"])
+    for col in ("s_score", "s_sw", "s_w"):
+        agg[col] = agg[col].astype(float)
+    dist = {}
+    if axis == "leaning":   # intensity는 label이 NULL이라 라벨 분포가 의미 없다
+        cur.execute("SELECT label, count(*) FROM comment_labels WHERE run_id = %s GROUP BY label",
+                    (run_id,))
+        dist = {lbl: n for lbl, n in cur.fetchall()}
+    return agg, dist
+
+
+def ranking_text(agg, title, axis="leaning", only_type=None):
+    """채널별 순위를 문자열로 만든다. agg는 (outlet, ctype, n, s_score, s_sw, s_w) 합계.
+    leaning: 점수=P(우)−P(좌), 진보(음수)→보수(양수) 오름차순, 통념 열 표시.
+    intensity: 점수=과격도 0~1, 과격한 순(내림차순), 통념 열 없음."""
+    d = agg if only_type is None else agg[agg["ctype"] == only_type]
+    if d.empty:
+        return ""
+    if only_type is None:
+        g = d.copy()                                    # outlet/ctype 각각 한 줄
+    else:
+        g = d.groupby("outlet", as_index=False)[["n", "s_score", "s_sw", "s_w"]].sum()
+    g["mean"] = g["s_score"] / g["n"]
+    g["wmean"] = np.where(g["s_w"] > 0, g["s_sw"] / g["s_w"], g["mean"])
+    leaning = axis == "leaning"
+    g = g.sort_values("mean", ascending=leaning)        # 과격도는 높은 순으로
+
+    if leaning:
+        out = [f"\n{'='*72}\n{title}  (음수=진보 / 양수=보수)",
+               f"  {'채널':<20}{'단순평균':>9}{'좋아요가중':>11}{'통념':>10}{'표본':>9}"]
+    else:
+        out = [f"\n{'='*72}\n{title}  (과격도 0=온건 ~ 1=과격, 높을수록 과격)",
+               f"  {'채널':<20}{'단순평균':>9}{'좋아요가중':>11}{'표본':>11}"]
     for _, r in g.iterrows():
         name = f"{r['outlet']}/{r['ctype']}" if only_type is None else r["outlet"]
-        conv = CONVENTION.get(r["outlet"], "—")
-        out.append(f"  {name:<20}{r['mean']:>+9.3f}{r['wmean']:>+11.3f}{conv:>10}{int(r['n']):>9,}")
+        if leaning:
+            conv = CONVENTION.get(r["outlet"], "—")
+            out.append(f"  {name:<20}{r['mean']:>+9.3f}{r['wmean']:>+11.3f}{conv:>10}{int(r['n']):>9,}")
+        else:
+            out.append(f"  {name:<20}{r['mean']:>9.3f}{r['wmean']:>11.3f}{int(r['n']):>11,}")
     return "\n".join(out)
 
 
@@ -181,7 +262,9 @@ def main():
     p.add_argument("--run", help="run_id (기본: 축별 default)")
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--limit", type=int, help="빠른 점검용 댓글 수 제한")
-    p.add_argument("--no-db", action="store_true", help="DB 적재 없이 순위만 출력")
+    p.add_argument("--no-db", action="store_true", help="DB 적재 없이 순위만 출력(이번 배치 기준)")
+    p.add_argument("--reinfer", action="store_true",
+                   help="이미 라벨된 댓글도 전부 다시 추론(모델 교체 시). 기본은 미라벨분만(증분).")
     args = p.parse_args()
 
     cfg = AXIS_CONFIG[args.axis]
@@ -197,11 +280,17 @@ def main():
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
     if not os.path.isdir(model_path):
         raise SystemExit(f"모델을 찾을 수 없습니다: {model_path}\n먼저 train.py --save 로 저장하세요.")
+    # 증분(기본): 이 run_id로 아직 라벨이 없는 정치 댓글만 추론한다. 수집이 계속돼도
+    # 매번 전량(59.7만)을 다시 돌리지 않는다. --reinfer면 전량 재추론(모델 교체 시 덮어쓰기).
+    incremental = not args.reinfer and not args.no_db
     print(f"축 {args.axis} / run_id {run_id} / 모델 {model_path}")
+    print(f"모드: {'증분(미라벨분만)' if incremental else '전량 재추론'}"
+          f"{' / DB 미적재' if args.no_db else ''}")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForSequenceClassification.from_pretrained(model_path).to(device).eval()
 
-    # ── ① 시작: 댓글을 한 번 fetch (이후 추론 끝까지 DB 접근 없음) ──
+    # ── ① 시작: 추론 대상 fetch (이후 추론 끝까지 DB 연결을 닫아 둔다) ──
+    t_fetch = time.perf_counter()
     conn = psycopg2.connect(url)
     cur = conn.cursor()
     q = """
@@ -212,56 +301,79 @@ def main():
         WHERE v.is_political AND length(c.text) BETWEEN %s AND %s
         """
     params = [MIN_TEXT_LEN, MAX_TEXT_LEN]
+    if incremental:   # 이 run으로 아직 라벨 없는 것만 (PK(run_id,comment_id) 인덱스 조회)
+        q += """ AND NOT EXISTS (SELECT 1 FROM comment_labels cl
+                                 WHERE cl.run_id = %s AND cl.comment_id = c.comment_id)"""
+        params.append(run_id)
     if args.limit:
         q += " LIMIT %s"; params.append(args.limit)
     cur.execute(q, params)
     rows = cur.fetchall()
-    conn.close()   # 추론 동안 연결을 닫아 둔다(무료 티어 유휴 연결 정리)
-    print(f"추론 대상 {len(rows):,}건 / {device} / batch {args.batch}\n")
+    conn.close()
+    fetch_sec = time.perf_counter() - t_fetch
+    print(f"fetch {len(rows):,}건 / {fetch_sec:.1f}s / {device} / batch {args.batch}")
 
-    # ── ② 추론: GPU만 사용, DB 무접근, 진행률 flush + 파일 ──
-    ids = [r[0] for r in rows]
-    texts = [r[1] for r in rows]
-    cb, prog_path = progress_writer(run_id, len(rows))
-    t0 = time.perf_counter()
-    labels, scores, confs = run_inference(model, tokenizer, texts, args.batch, device,
-                                          cfg["post"], cb)
-    infer_sec = time.perf_counter() - t0
-    print(f"추론 완료 ({infer_sec:.0f}초)")
+    # ── ② 추론: GPU만, DB 무접근 ──
+    infer_sec = push_sec = 0.0
+    ids = labels = scores = confs = None
+    if rows:
+        ids = [r[0] for r in rows]
+        texts = [r[1] for r in rows]
+        cb, prog_path = progress_writer(run_id, len(rows))
+        t_inf = time.perf_counter()
+        labels, scores, confs = run_inference(model, tokenizer, texts, args.batch, device,
+                                              cfg["post"], cb)
+        infer_sec = time.perf_counter() - t_inf
+        if os.path.exists(prog_path):
+            os.remove(prog_path)
+        print(f"추론 완료 ({infer_sec:.0f}s)")
+    else:
+        print("추론할 미라벨 댓글이 없습니다(이미 최신) — 순위만 갱신합니다.")
 
-    # ── ③ 완료 후: DB 배치 적재 ──
-    if not args.no_db:
+    # ── ③ 적재 + ④ 집계: 추론 뒤 연결 하나로 처리 ──
+    if args.no_db:
+        if not rows:
+            print("표시할 데이터가 없습니다."); return
+        agg, dist = _agg_from_rows(rows, labels, scores)
+    else:
         conn = psycopg2.connect(url)
-        save_to_db(conn, run_id, args.axis, os.path.basename(model_path.rstrip("/\\")),
-                   ids, labels, scores, confs)
+        if rows:
+            t_push = time.perf_counter()
+            save_to_db(conn, run_id, args.axis, os.path.basename(model_path.rstrip("/\\")),
+                       ids, labels, scores, confs)
+            push_sec = time.perf_counter() - t_push
+            print(f"DB 적재 완료 ({push_sec:.0f}s): comment_labels (run_id='{run_id}')")
+        agg, dist = fetch_run_aggregates(conn, run_id, args.axis)  # 전체 run 기준(증분이어도 전체 반영)
         conn.close()
-        print(f"DB 적재 완료: comment_labels (run_id='{run_id}')")
 
-    # ── ④ 집계 + 로컬 요약 ──
-    df = pd.DataFrame({
-        "outlet": [r[2] for r in rows], "ctype": [r[3] for r in rows],
-        "like": np.array([r[4] for r in rows], dtype=np.int32),
-        "label": labels, "score": scores,
-    })
-    dist = pd.Series(labels).value_counts()
-    dist_line = "  ".join(f"{KO.get(l, l)} {int(dist.get(l, 0)):,}" for l in LABELS)
-
+    total_run = int(sum(dist.values())) if dist else int(agg["n"].sum())
     blocks = [f"run_id: {run_id}   축: {args.axis}   모델: {model_path}",
-              f"생성: {time.strftime('%Y-%m-%d %H:%M')}   추론 {len(rows):,}건 / {infer_sec:.0f}초",
-              f"분류 분포: {dist_line}"]
+              f"생성: {time.strftime('%Y-%m-%d %H:%M')}   "
+              f"이번 실행 {len(rows):,}건 추론 / run 전체 {total_run:,}건",
+              f"소요: fetch {fetch_sec:.1f}s · infer {infer_sec:.0f}s · push {push_sec:.0f}s"]
     if args.axis == "leaning":
-        blocks.append(ranking_text(df, "전체 (news + opinion)", None))
-        blocks.append(ranking_text(df, "news 채널만", "news"))
-        blocks.append(ranking_text(df, "opinion(시사) 채널만", "opinion"))
+        dist_line = "  ".join(f"{KO.get(l, l)} {int(dist.get(l, 0)):,}" for l in LABELS)
+        blocks.append(f"분류 분포(run 전체): {dist_line}")
+        blocks.append(ranking_text(agg, "전체 (news + opinion)", args.axis, None))
+        blocks.append(ranking_text(agg, "news 채널만", args.axis, "news"))
+        blocks.append(ranking_text(agg, "opinion(시사) 채널만", args.axis, "opinion"))
+    else:   # intensity — 채널 과격도 순위
+        tot_n = agg["n"].sum()
+        overall = agg["s_score"].sum() / tot_n if tot_n else 0.0
+        blocks.append(f"전체 평균 과격도: {overall:.3f} (0=온건 ~ 1=과격)")
+        blocks.append(ranking_text(agg, "채널 과격도 — 전체 (news + opinion)", args.axis, None))
+        blocks.append(ranking_text(agg, "채널 과격도 — news만", args.axis, "news"))
+        blocks.append(ranking_text(agg, "채널 과격도 — opinion만", args.axis, "opinion"))
     report = "\n".join(b for b in blocks if b)
     print("\n" + report)
 
+    if args.limit:
+        print("\n(--limit 부분 실행이라 로컬 요약 파일은 덮어쓰지 않음)")
+        return
     os.makedirs(RESULTS_DIR, exist_ok=True)
     summary_path = os.path.join(RESULTS_DIR, f"{run_id}.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write(report + "\n")
-    if os.path.exists(prog_path):
-        os.remove(prog_path)   # 완료됐으므로 진행률 파일 정리
     print(f"\n로컬 요약 저장: {summary_path}")
 
 if __name__ == "__main__":

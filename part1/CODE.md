@@ -9,7 +9,7 @@ Part 1(뉴스 채널 정치성향 분석)의 `part1/` 디렉토리에 있는 각
 part1/
 ├── migrate.py, DB_migrations/, requirements.txt   ← 공용 (스키마·의존성)
 ├── Data/   collect · backfill · prune · reclassify · keywords(.py/.json)   ← 수집·ETL
-├── AI/     train · sanity_check · freeze_sample · sample_trainset · ingest_trainset · blind_check · infer   ← 학습·라벨링·추론
+├── AI/     train · train_intensity · sanity_check · freeze_sample · sample_trainset · ingest_trainset · blind_check · infer   ← 학습·라벨링·추론
 └── viz/    app · views/ · queries · theme · util (+ DESIGN.md)   ← 시각화 대시보드(Streamlit, 로컬)
 ```
 
@@ -109,6 +109,9 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 - `--train-run RUN`(학습셋 run_id 지정), `--curve`(학습곡선, **스텝 수 고정**), `--tune`(dev로 하이퍼파라미터 선택 후 평가셋 1회 측정), `--labels human-first`(맹검 100건을 사람 라벨로 교체), `--class-weights`(드문 클래스 보정), `--save DIR`(모델 저장).
 - **epoch을 너무 작게 두면 학습이 안 된다** — 700÷32=22스텝/epoch이라 4 epoch(88스텝)은 부족해 `좌`·`불가`를 아예 예측 못 한다. 기본 15 epoch(330스텝).
 
+### `train_intensity.py` — 과격도(강도 축) 분류기 학습
+성향 축(train.py)과 **독립**. `humane-lab/K-HATERS`(네이버 뉴스 댓글 19만, EMNLP 2023)의 4단계 공격성(`normal`<`offensive`<`L1_hate`<`L2_hate`)으로 KcELECTRA를 파인튜닝 → `models/khaters_v1`. **우리 손라벨 불필요**(데이터셋에 라벨이 있음). 학습 루프는 train.py와 같은 검증된 패턴(fp16 GradScaler·AdamW·OneCycleLR·class-weights). HuggingFace `datasets`로 로드. ⚠️ `LABELS` 순서가 `infer.py`의 `_postprocess_intensity`와 일치해야 함(모델 출력 인덱스). 사용: `python AI/train_intensity.py --epochs 2 --class-weights --save ../models/khaters_v1` (스모크: `--limit 2000 --epochs 1`).
+
 ### `sanity_check.py` — 순열 검정
 "예측 분포가 학습셋 분포를 따라 찍는 것 아닌가"를 가른다. **라벨을 무작위로 섞어** 텍스트-정답 관계를 끊은 대조군과 비교(정상 74.7% vs 셔플 38.7%, z=9.1). 라벨·입력을 바꿀 때마다 재실행해 "진짜 학습인지"를 확인한다. `train.py`의 함수를 import한다.
 
@@ -127,9 +130,13 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 ### `infer.py` — 전체 댓글 추론·적재 (Part 1 결론 단계)
 학습된 모델을 전체 댓글에 적용해 채널별 성향 점수를 낸다. 개별 정확도가 아니라 **채널 순위가 통념과 맞는가**가 목적이다(수만 건 평균이라 개별 오차는 상쇄된다).
 
-- **원격 DB 접근은 앞뒤 한 번씩만** — 시작에 댓글을 fetch → GPU로 전부 추론 → 완료 후 `comment_labels`에 청크 배치 UPSERT(추론 중에는 DB 미접근). label=argmax, score=P(우)−P(좌), confidence=max prob.
-- **2축 확장 대비** — 축별 후처리를 `AXIS_CONFIG`로 분리했다. `leaning`(기본)만 구현돼 있고, 강도 축(K-HATERS)은 후처리 함수 하나만 추가하면 `--axis intensity`로 붙는다.
-- 기본 모델 `models/kcelectra_v2`, run_id `model_kcelectra_v2`. `results/<run_id>.txt`(채널 순위·분포)와 `.progress`(진행률)를 로컬에도 남긴다(`results/`는 gitignore).
+- **증분이 기본** — 이 run_id로 아직 라벨 없는 정치 댓글만 추론(`NOT EXISTS`, PK(run_id,comment_id) 인덱스 조회). 수집이 계속돼도 매번 전량(61만)을 다시 안 돌린다. 모델 교체로 전량 덮어쓸 땐 `--reinfer`, 적재 없이 점검은 `--no-db`(이번 배치 기준 순위), 빠른 점검은 `--limit N`(요약 파일 안 덮음).
+- **원격 DB 접근은 앞뒤 한 번씩만** — 시작에 대상 fetch(연결 닫음) → GPU 추론(DB 무접근) → 완료 후 연결 하나로 `comment_labels` 청크 UPSERT + 순위 집계. label=argmax, score=P(우)−P(좌), confidence=max prob.
+- **길이순 버킷팅**(`run_inference`) — 비슷한 길이끼리 배치해 패딩 낭비 제거 → **추론 ~4배**(실측 15k: 150→600건/s). 결과는 원래 순서로 복원해 ids/like와 정렬 유지(수치 동일).
+- **순위는 SQL GROUP BY로 전체 run 집계**(`fetch_run_aggregates`) — 60만 행을 파이썬으로 안 끌어오고 채널 ~13행만. 증분 추론 뒤에도 순위가 전체를 반영. (`--no-db`일 때만 이번 배치로 in-메모리 집계.) ⚠️ CockroachDB는 `ln()`에 float 캐스팅 필요(`::float8`).
+- **구간별 타이머**(fetch/infer/push)를 출력해 병목을 바로 볼 수 있다. 실측 병목은 **GPU 추론**(push·fetch보다 큼).
+- **2축 지원** — 축별 후처리를 `AXIS_CONFIG`로 분리. `leaning`(P우−P좌) / `intensity`(과격도=기대서열/3, label NULL) 둘 다 구현. `--axis intensity`는 `models/khaters_v1`·run_id `model_khaters_v1`. 집계·순위도 axis-aware(intensity는 unusable 필터 없이 전량, 과격한 순 정렬).
+- 기본 모델 `models/kcelectra_v2`, run_id `model_kcelectra_v2`. `results/<run_id>.txt`(순위·분포)·`.progress`(진행률)를 로컬에도 남긴다(`results/`는 gitignore).
 
 ### `requirements.txt` (수집용) / `AI/requirements.txt` (학습용)
 - **`requirements.txt`** — 수집·ETL과 CI가 쓴다. `google-api-python-client` / `psycopg2-binary` / `python-dotenv`. 병렬 처리는 표준 라이브러리(`concurrent.futures`)라 별도 의존성 없음.
@@ -147,10 +154,10 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 | 파일 | 역할 |
 |---|---|
 | `app.py` | 진입점. `st.navigation` 멀티페이지(대시보드·채널 별 통계·채널 비교) + 공용 폰트(Pretendard)/배경 CSS. ⚠️ `font-family:*` 전역 지정이 material 아이콘 폰트를 덮어 아이콘이 글자로 새므로 아이콘 폰트를 명시 복원한다. 기본 우상단 실행 인디케이터는 숨기고 중앙 원형 스피너로 대체 |
-| `views/dashboard.py` | 채널 행(HTML 카드: 로고+이름 밀착, 카드 전체 클릭 시 `?outlet=`로 상세 이동) + 좌\|중립\|우 3색 그라데이션 바(중립 저채도). ⚠️ `st.image(...) if x else ...` 삼항은 Streamlit magic으로 화면에 새어 나가므로 if/else 문으로 쓴다 |
-| `views/channel_stats.py` | 채널 일별 좌%·우% 시계열. 원시/EMA 전환은 **plotly updatemenus 버튼(클라이언트)** — Streamlit 위젯이면 매번 서버 rerun이라 전환이 뚝뚝 끊긴다. 하단 x축 공유 댓글 수 막대(영상 수 hover). 강도 탭은 자리만 |
-| `views/compare.py` | 채널별 '판정 중 우비율' EMA를 한 그래프에 채널 브랜드색으로 겹침 + 50% 균형선. **X축은 선택 채널의 공통 기간(교집합)으로 트림** — 채널마다 소급 깊이가 달라도 공정 비교(EMA는 전체 이력으로 계산 후 보기만 자름). 개별 채널 전체 깊이는 `channel_stats.py`에서 |
-| `queries.py` | DB 집계(모두 `@st.cache_data`). **미분류 배제가 여기 박혀 있다** — `comment_labels`(run=`model_kcelectra_v2`)와 inner join이라 collect.py가 지금 쌓는 미추론 신규 댓글은 자동 제외(`unusable` 제외, `neutral` 포함). `RUN_BY_AXIS`로 축→run_id 매핑(강도 축 대비) |
+| `views/dashboard.py` | 사이드바 "축" 라디오로 성향/강도 분기. **성향**: 채널 행(HTML 카드: 로고+이름 밀착, 카드 전체 클릭 시 `?outlet=`로 상세 이동) + 좌\|중립\|우 3색 그라데이션 바(중립 저채도). **강도**: 채널 과격도 순위(amber 바), 미적재면 '준비중'. ⚠️ `st.image(...) if x else ...` 삼항은 Streamlit magic으로 화면에 새어 나가므로 if/else 문으로 쓴다 |
+| `views/channel_stats.py` | 채널 일별 좌%·우% 시계열. 원시/EMA 전환은 **plotly updatemenus 버튼(클라이언트)** — Streamlit 위젯이면 매번 서버 rerun이라 전환이 뚝뚝 끊긴다. 하단 x축 공유 댓글 수 막대(영상 수 hover). **강도 탭 = 일별 과격도(0~1) 시계열**(같은 원시/EMA 버튼 패턴, amber색), 강도 미적재면 '준비중' |
+| `views/compare.py` | 채널별 '판정 중 우비율' EMA를 한 그래프에 채널 브랜드색으로 겹침 + 50% 균형선. **X축은 선택 채널의 공통 기간(교집합)으로 트림** — 채널마다 소급 깊이가 달라도 공정 비교(EMA는 전체 이력으로 계산 후 보기만 자름). 개별 채널 전체 깊이는 `channel_stats.py`에서. ⚡ 전 채널을 **단일 쿼리 `all_channels_timeseries`**로 집계(채널마다 따로 부르면 61만 행 조인을 10회 반복해 38s→6s로 느렸음) |
+| `queries.py` | DB 집계(모두 `@st.cache_data`). **미분류 배제가 여기 박혀 있다** — `comment_labels`와 inner join이라 미추론 신규 댓글은 자동 제외. `RUN_BY_AXIS`로 축→run_id 매핑. 성향: `channel_summary`/`channel_timeseries`(label 좌/우/중립, unusable 제외)/**`all_channels_timeseries`**(compare용 — 전 채널 일별 좌/우를 `GROUP BY outlet,일`로 한 쿼리에; 채널마다 따로 부르면 61만 행 조인 10회로 느림). **강도**: `has_intensity`(적재 여부)·`channel_intensity_summary`·`channel_intensity_timeseries`(score=과격도, label NULL이라 unusable 필터 없음) |
 | `theme.py` | Sentry 다크 팔레트(`COLORS`)·채널 브랜드색(`CHANNEL_COLORS`)·성향 관례(`CONVENTION`) |
 | `util.py` | `center_spinner()` — 화면 중앙 원형 로딩 스피너 컨텍스트매니저 |
 
