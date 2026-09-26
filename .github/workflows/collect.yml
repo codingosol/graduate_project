@@ -2,8 +2,9 @@ name: daily-collect
 
 # 매일 도는 것은 "수집 + 필터 + 저장"까지다.
 #   collect.py : 최근 24시간 신규 정치영상·댓글 수집 (우선)
-#   backfill.py: 남은 쿼터로 과거를 하한선(prune.RETENTION_FLOOR = 2025-08-01)까지 소급 수집
-#   → CockroachDB 적재 (DATABASE_URL)
+#   backfill.py: 남은 쿼터로 과거를 하한선(backfill.RETENTION_FLOOR = 2025-08-01)까지 소급 수집
+#   → 스테이징 DB(Neon 무료 0.5GB, secrets.STAGING_DATABASE_URL) 적재.
+#     로컬 분석 DB로는 로컬에서 `python Data/sync.py`로 옮기고, 옮긴 수집분은 스테이징에서 지운다.
 #
 # 좌/우/중립/불가 성향 분류는 이 워크플로에 넣지 않는다(학습·추론은 로컬 GPU 배치).
 #   근거: DECISIONS.md 2026-07-20 "학습·추론 실행 위치".
@@ -37,21 +38,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # CockroachDB는 sslmode=verify-full 접속이라 러너에 CA 인증서가 필요하다.
-      # libpq가 자동으로 찾는 위치(~/.postgresql/root.crt)에 클러스터 공개 CA 인증서를 받는다.
-      - name: Download CockroachDB CA cert
-        run: |
-          mkdir -p ~/.postgresql
-          curl -fsSL -o ~/.postgresql/root.crt \
-            https://cockroachlabs.cloud/clusters/6c61acba-fd2e-4673-918a-749064f3f307/cert
-
       # collect.py를 먼저 돌려 그날 신규분을 확보하고(우선), 소모한 쿼터를 QUOTA_SPENT로 파싱해
       # 하루 쿼터(10,000)에서 안전여유(500)를 뺀 나머지를 backfill --budget 으로 넘긴다.
       # 남은 쿼터가 1,000 미만이면 backfill은 건너뛴다(다음 날 이어서 소급).
       - name: Collect (priority) then backfill with remaining quota
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          STAGING_DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
         run: |
           set -o pipefail
           python Data/collect.py | tee collect.out

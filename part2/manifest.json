@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "내 유튜브 알고리즘 정치 성향 진단",
+  "version": "0.1.0",
+  "description": "추천 피드/시청기록의 정치·뉴스 영상을 진보/중도/보수로 진단합니다 (SKKU 졸업작품 Part 2).",
+  "permissions": ["storage", "scripting"],
+  "host_permissions": ["https://www.youtube.com/*"],
+  "action": {
+    "default_title": "유튜브 성향 진단",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["data/leaning_table.json", "data/channel_dashboard.json"],
+      "matches": ["https://www.youtube.com/*"]
+    }
+  ]
+}

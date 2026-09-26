@@ -43,17 +43,18 @@ MAX_PAGES_PER_CHANNEL = 600  # 2차 안전장치. 페이지도 quota에서 차�
 # 실제 제한은 예산이고, 이 값은 예산보다 크게 둬서 "예산이 먼저 소진되도록" 한다.
 # (너무 작으면 예산을 다 쓰기 전에 페이지 상한에 걸려 소급이 얕게 끝남)
 
-# 소급 수집 하한선. prune.py와 **같은 값을 공유**한다.
-# 하한을 두 곳에 따로 적으면 backfill이 긁어온 구간을 prune이 곧바로 지우거나 그 반대가 되므로,
-# 반드시 한 곳에서만 정의한다.
+# 소급 수집 하한선. 이 시각보다 이전에 업로드된 영상은 수집하지 않는다(전 채널 공통 커버 기간).
+# 목적이 '채널 간 비교'인 이상 깊이보다 **모든 채널이 같은 기간을 커버하는 것**이 중요하다.
 #
-# 1년(365일)에서 3개월 고정 날짜로 바꾼 이유:
-#   무료 티어 512MB에서 1년치는 물리적으로 불가능하다. 실측으로 영상 1편 = 약 8.5KB인데
-#   news 채널은 월 700~1,850편을 올린다. 9개 채널을 1년까지 채우면 12만~14만 편(1.3GB급)이라
-#   담을 수 있는 최대치의 4배다. 쿼터가 아니라 저장 용량이 먼저 터진다.
-#   목적이 '채널 간 비교'인 이상 깊이보다 **모든 채널이 같은 기간을 커버하는 것**이 중요하므로,
-#   전 채널 공통 하한을 2026-04-21(약 3개월)로 통일했다.
-from prune import RETENTION_FLOOR
+# 2026-08-05 변경: 2026-04-21(약 3개월) → 2025-08-01(약 1년). 3개월은 순전히 옛 Neon 512MB 용량
+# 때문이었고, 용량이 늘어 1년으로 확장했다. 2025-08은 이재명 취임(2025-06-04) 이후라 라벨링 규칙
+# ("대통령"=이재명)이 유지된다 — 이보다 더 내리면 윤석열 정권기가 섞여 기존 라벨을 전부 재검토해야
+# 하므로 내리지 말 것(경위: DECISIONS.md, Part1.md §2).
+# ⚠️ 업로드가 많은 채널은 playlistItems 최근 ~2만 편 한계로 2025-08까지 못 닿을 수 있고,
+#    그 경우 도달 지점을 최고령으로 인정해 exhausted 처리한다(YTN·연합과 동일).
+# (예전엔 하한 밑 데이터를 지우는 prune.py가 이 값을 정의했으나, 하한 밑 데이터가 생기지 않고
+#  용량 제약도 없어져 2026-09-26 삭제했다.)
+RETENTION_FLOOR = "2025-08-01"
 
 BACKFILL_FLOOR = datetime.fromisoformat(RETENTION_FLOOR).replace(tzinfo=timezone.utc)
 
@@ -432,9 +433,10 @@ def main():
     start = time.perf_counter()
 
     api_key = os.environ.get("YOUTUBE_API_KEY")
-    database_url = os.environ.get("DATABASE_URL")
+    # collect.py와 같이 스테이징 DB(Neon)에만 쓴다. 채널 커서(backfill_cursor)도 스테이징이 정본이다.
+    database_url = os.environ.get("STAGING_DATABASE_URL")
     if not api_key or not database_url:
-        raise SystemExit("YOUTUBE_API_KEY / DATABASE_URL 환경변수가 필요합니다.")
+        raise SystemExit("YOUTUBE_API_KEY / STAGING_DATABASE_URL 환경변수가 필요합니다.")
 
     # minconn = maxconn으로 둔다. psycopg2의 putconn은 보유 연결이 minconn 이상이면 반납된 연결을
     # 보관하지 않고 close()하므로, minconn이 작으면 매번 새 연결을 만들게 된다

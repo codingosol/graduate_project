@@ -8,9 +8,8 @@ Part 1(뉴스 채널 정치성향 분석)의 `part1/` 디렉토리에 있는 각
 ```
 part1/
 ├── migrate.py, DB_migrations/, requirements.txt   ← 공용 (스키마·의존성)
-├── Data/   collect · backfill · prune · reclassify · keywords(.py/.json)   ← 수집·ETL
-├── AI/     train · train_intensity · sanity_check · freeze_sample · sample_trainset · ingest_trainset · blind_check · infer   ← 학습·라벨링·추론
-└── viz/    app · views/ · queries · theme · util (+ DESIGN.md)   ← 시각화 대시보드(Streamlit, 로컬)
+├── Data/   collect · backfill · sync · reclassify · keywords(.py/.json)   ← 수집·ETL
+└── AI/     train · train_intensity · sanity_check · freeze_sample · sample_trainset · ingest_trainset · blind_check · infer   ← 학습·라벨링·추론
 ```
 
 - **실행은 `part1/`에서** `python Data/collect.py`, `python AI/train.py` 형태.
@@ -21,17 +20,23 @@ part1/
 ## 전체 흐름
 
 ```
-YouTube Data API                    CockroachDB Cloud (운영 DB)
-      │                                    ▲
-      │  channels → playlistItems          │
-      │  → videos(카테고리) → 필터         │
-      │  → commentThreads                  │
-      ▼                                    │
-  Data/collect.py  ──── 적재 ──────────────┘
-      │                        (운영 DB에 직접 적재 — DATABASE_URL이 가리키는 CockroachDB)
-      ├── Data/keywords.py / keywords.json  (2차 필터: 정치 키워드 판별)
-      └── migrate.py / DB_migrations/       (스키마 관리, 공용)
+YouTube Data API
+      │  channels → playlistItems → videos(카테고리) → 필터 → commentThreads
+      ▼
+  Data/collect.py · backfill.py  (GitHub Actions, 매일)
+      │ 적재
+      ▼
+  스테이징 DB — Neon 무료 0.5GB (STAGING_DATABASE_URL)   ← 수집분 임시 보관 + 수집 상태(채널 커서·watermark)만
+      │  python Data/sync.py  (로컬에서 실행: 복사 → 옮긴 댓글은 스테이징에서 삭제)
+      ▼
+  로컬 분석 DB — Docker PostgreSQL 18 (DATABASE_URL)       ← 전체 데이터·라벨의 정본
+      └── AI/(학습·라벨링·추론) · reclassify · part2/tools/export_data.py(→ 크롬 익스텐션 데이터)
+
+  공용: Data/keywords.py / keywords.json (2차 필터), migrate.py / DB_migrations/ (두 DB 같은 스키마)
 ```
+
+무거운 작업(추론 적재·집계·대시보드)은 전부 로컬 DB에서만 한다. 스테이징은 매일 수천 행이 들어왔다
+나가는 버퍼라 무료 한도 안에 머문다(경위: `../DECISIONS.md` 2026-09-26).
 
 ## 파일별 역할
 
@@ -45,7 +50,7 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 - 댓글은 `execute_values`로 **영상당 1회 일괄 삽입**(건당 INSERT 대비 DB 왕복 대폭 절감)
 - `commentsDisabled`(HTTP 403)는 정상 케이스로 스킵하고 `videos.comments_disabled` 플래그 기록
 
-**적재 대상**: `DATABASE_URL`이 가리키는 운영 DB에 직접 적재한다. **현재 운영 DB는 CockroachDB Cloud(무료 10GB)** — Neon(0.5GB) 한도 근접으로 2026-08-05 이전했다(경위·접속(verify-full+CA인증서)은 [Part1.md](Part1.md) §3). 그 전엔 Neon `newstance`였고(테스트 DB `collect_test`를 rename 승격, 08-04), 이때 test/운영 분리(`ensure_test_database`)와 공용 `db.py`가 제거돼 모든 스크립트가 `DATABASE_URL`에 직접 연결한다.
+**적재 대상**: `STAGING_DATABASE_URL`이 가리키는 **스테이징 DB(Neon)**에만 적재한다(`backfill.py`도 동일). 로컬 분석 DB로는 `sync.py`가 옮긴다. 재개 지점(채널별 최신 영상 `published_at`)도 스테이징에서 읽으므로, `sync.py`는 채널별 최신 영상을 스테이징에 남긴다. (이력: Neon `newstance` → 2026-08-05 CockroachDB → 2026-09-04 체험판 만료로 차단 → 09-26 현재 구조. [Part1.md](Part1.md) §3)
 
 ### `keywords.json` — 정치 키워드 데이터
 2차 필터가 쓰는 키워드를 코드와 분리해 데이터로 관리(정치인·정당명은 시간이 지나면 낡아지므로 갱신이 잦음).
@@ -76,7 +81,7 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 - `DB_migrations/0009_channel_thumbnail.sql`: `channels.thumbnail_url` 추가 — 시각화 대시보드의 채널 카드 로고용. `channels.list`(snippet.thumbnails)로 13개 채널 1회 수집
 - `migrate.py`: 아직 적용 안 된 `.sql` 파일만 순서대로 실행하고 `schema_migrations` 테이블에 이력 기록
 - **스키마를 바꿀 땐 기존 파일을 수정하지 말고 `0002_xxx.sql` 같은 새 파일을 추가할 것** (기존 파일 수정 시 이미 적용된 DB와 어긋남)
-- 실행: `python migrate.py` — `DATABASE_URL`(현재 CockroachDB) 대상. 각 수집·학습 스크립트도 실행 시 같은 DB에 직접 연결한다. (CockroachDB엔 최종 상태 스키마를 직접 생성하고 0001~0009를 기록해둬서 at-head 상태다 — Part1.md §3.)
+- 실행: `python migrate.py` — `DATABASE_URL`(로컬 분석 DB) 대상. `python migrate.py --staging` — `STAGING_DATABASE_URL`(Neon) 대상. **새 마이그레이션은 두 DB 모두에 적용할 것** — 스키마가 다르면 `sync.py`가 컬럼 불일치로 멈춘다.
 
 ### `backfill.py` — 과거 영상 소급 수집
 매일 24시간치만 모으는 `collect.py`와 달리 **더 과거로** 소급 수집하는 도구. 상시 실행하지 않고, 하루 남은 쿼터에 맞춰 수동으로 돌린다.
@@ -87,16 +92,16 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 - **필요량(`need`)은 통과 비용 + 소급 비용**이다(2026-07-25). 커서까지 다시 넘기는 `days_since_cursor × PASS_UNITS_PER_DAY`와 커서 아래로 내려가는 `days_left × UNITS_PER_DAY`의 합. 통과 비용을 빼먹으면 커서 깊은 채널(YTN, 커서 92일 전)이 남은 일수가 적다는 이유로 최소 예산만 받아 **커서에 닿지도 못하고 끝난다**(실측: 300 unit으로 훑음 0건).
 - `TOTAL_BUDGET`(7,920)만 조정하면 되고, `EXCLUDED_OUTLETS`는 이미 충분히 모인 채널을 제외
 - 재개 지점은 `channels.backfill_cursor`(실제로 훑은 가장 오래된 지점). `MIN(published_at)`을 쓰면 정치 영상이 없는 구간을 훑고도 커서가 안 움직여 매일 같은 구간을 다시 훑게 됨
-- 하한선은 `prune.RETENTION_FLOOR`를 **import해서 공유**한다. 두 곳에 따로 적으면 backfill이 긁어온 구간을 prune이 곧바로 지우는 일이 생김
+- 하한선 `RETENTION_FLOOR`(2025-08-01, 고정 날짜)는 이 파일에 정의한다. 롤링이 아니라 고정인 이유는 창이 앞으로만 자라 고정 평가셋이 깨지지 않게 하려는 것. 이보다 내리면 윤석열 정권기가 섞여 라벨 규칙이 깨지므로 내리지 말 것
 - 채널 조회 시 `outlet_name`이 아니라 **`CHANNELS`에서 얻은 `channel_id`로 직접 조회** — outlet_name이 DB에서 유일하지 않아 엉뚱한 채널을 긁은 사고가 있었음
 - 다시 쓸 땐 `TOTAL_BUDGET`을 그날 남은 실제 쿼터에 맞춰 조정할 것 (채널별 배분은 자동)
 
-### `prune.py` — 하한선보다 오래된 데이터 삭제
-`RETENTION_FLOOR`(고정 날짜)를 정의하는 **유일한 곳**이고 `backfill.py`가 이 값을 가져다 쓴다.
+### `sync.py` — 스테이징(Neon) → 로컬 분석 DB 동기화
+로컬에서 수동 실행. 전 테이블을 FK 순서로 키셋 청크 복사(로컬은 `ON CONFLICT`라 멱등)한 뒤, **이번 실행에서 복사한 기본키만** 스테이징에서 지운다 — 동기화 중 수집이 새로 넣은 행은 지워질 수 없다.
 
-- 롤링 윈도우가 아니라 **고정 날짜**인 이유: 롤링이면 시간이 지날수록 과거 댓글이 계속 삭제되는데, 고정 평가셋은 바뀌면 안 되므로 손으로 매긴 정답셋을 갉아먹는다. 고정 날짜면 창이 앞으로만 자란다
-- 시작 전에 삭제 범위 안의 손라벨/평가셋을 세어 보고, 평가셋이 걸리면 **옵션 없이 중단**한다(중간에 FK 위반으로 터지면 일부만 지워진 상태가 됨)
-- `VACUUM FULL`은 쓰지 않는다 — 일반 VACUUM으로 회수한 공간을 직후 backfill의 INSERT가 그대로 재사용하고, FULL은 ACCESS EXCLUSIVE 락과 순간 용량 급증을 부른다
+- 스테이징에 남기는 것: `outlets`·`channels`(backfill 커서의 정본), 채널별 최신 영상 + 최근 `--keep-days`(기본 14)일 영상. 지우는 것: 옮긴 `comments`, 라벨 테이블 행, 오래된 영상(댓글이 스테이징에 남지 않은 것만).
+- 충돌 처리: `channels`는 스테이징 값으로 갱신, `videos`는 `comments_disabled`·`last_checked_at`만 반영(`is_political`은 로컬 `reclassify.py`가 정본), 나머지는 DO NOTHING.
+- `--keep-staging`: 복사만. `--from-env NAME`: 다른 DB에서 복사만(원본은 절대 안 지움 — 옛 Neon 백업 이관에 사용). `--seed-staging`: 새 스테이징에 로컬의 수집 상태(채널·커서·채널별 최신 영상)를 심는다 — 빈 스테이징이면 backfill이 "지금"부터 다시 소급해 쿼터를 낭비하므로 필수.
 
 ### `reclassify.py` — 기존 영상의 정치 여부 재판정
 `keywords.json`을 고친 뒤 이미 저장된 영상의 `is_political`을 다시 계산한다. 키워드는 정치인·정당명이 섞여 있어 시간이 지나면 낡으므로 주기적으로 갱신 → 재판정이 필요하다.
@@ -107,7 +112,7 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 `beomi/KcELECTRA-base-v2022` 파인튜닝. 학습셋은 `--train-run`으로 고른다(기본 `llm_train_v1`) / 평가 300건(`manual_gold_v1`). 최종 배포 모델은 v2 라벨 1000건(`llm_train_v2_big`)으로 학습해 `models/kcelectra_v2`에 저장했다(근거: `../DECISIONS.md` 08-03).
 
 - **평가셋 오염 차단이 SQL에 박혀 있다** — `run_id='manual_gold_v1'`인 라벨 전부(잉여분 포함)를 학습에서 제외한다.
-- `--train-run RUN`(학습셋 run_id 지정), `--curve`(학습곡선, **스텝 수 고정**), `--tune`(dev로 하이퍼파라미터 선택 후 평가셋 1회 측정), `--labels human-first`(맹검 100건을 사람 라벨로 교체), `--class-weights`(드문 클래스 보정), `--save DIR`(모델 저장).
+- `--train-run RUN`(학습셋 run_id 지정), `--curve`(학습곡선, **스텝 수 고정**), `--tune`(dev로 하이퍼파라미터 선택 후 평가셋 1회 측정), `--class-weights`(드문 클래스 보정), `--save DIR`(모델 저장).
 - **epoch을 너무 작게 두면 학습이 안 된다** — 700÷32=22스텝/epoch이라 4 epoch(88스텝)은 부족해 `좌`·`불가`를 아예 예측 못 한다. 기본 15 epoch(330스텝).
 
 ### `train_intensity.py` — 과격도(강도 축) 분류기 학습
@@ -144,27 +149,12 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 - **`AI/requirements.txt`** — 학습·추론 전용(로컬 GPU). `-r ../requirements.txt`로 수집 의존성을 상속하고 `torch`(cu128 전용 인덱스)·`transformers`·`numpy`를 더한다. **GitHub Actions는 이 파일을 설치하지 않는다** — 러너엔 GPU가 없고 torch 2.8GB를 매 실행 받을 이유가 없다.
 
 ### `.env` (gitignore됨)
-로컬 실행용 `YOUTUBE_API_KEY`, `DATABASE_URL`. GitHub Actions에서는 같은 이름의 Secrets가 환경변수로 주입되므로 **코드는 양쪽에서 동일하게 `os.environ`으로 읽음**.
+- `YOUTUBE_API_KEY`
+- `DATABASE_URL` — **로컬 분석 DB**(Docker 컨테이너 `newstance-pg`, 127.0.0.1:5432). 수집 외의 모든 스크립트가 읽는다.
+- `STAGING_DATABASE_URL` — **스테이징 DB(Neon)**. `collect.py`·`backfill.py`·`sync.py`·`migrate.py --staging`만 읽는다.
+- `NEON_BACKUP_DATABASE_URL` — 옛 Neon(2026-08-02까지 데이터). 로컬 첫 이관 원본. `COCKROACH_DATABASE_URL` — 체험판 만료로 차단된 옛 운영 DB(보존용).
 
-## viz/ — 시각화 대시보드 (Streamlit, 로컬)
-
-추론 결과(`comment_labels`)를 보고서용으로 탐색·캡처하는 로컬 대시보드. 설계 정본은 `viz/DESIGN.md`,
-배경·경위는 [Part1.md](Part1.md) §8과 `../DECISIONS.md` 08-04 (4). 의존성은 `viz/requirements.txt` 별도
-(`streamlit`·`plotly`·`pandas`·`psycopg2-binary`·`python-dotenv`). 실행: `cd part1/viz && streamlit run app.py`.
-
-| 파일 | 역할 |
-|---|---|
-| `app.py` | 진입점. `st.navigation` 멀티페이지(대시보드·채널 별 통계·채널 비교) + 공용 폰트(Pretendard)/배경 CSS. ⚠️ `font-family:*` 전역 지정이 material 아이콘 폰트를 덮어 아이콘이 글자로 새므로 아이콘 폰트를 명시 복원한다. 기본 우상단 실행 인디케이터는 숨기고 중앙 원형 스피너로 대체 |
-| `views/dashboard.py` | 사이드바 "축" 라디오로 성향/강도 분기. **성향**: 채널 행(HTML 카드: 로고+이름 밀착, 카드 전체 클릭 시 `?outlet=`로 상세 이동) + 좌\|중립\|우 3색 그라데이션 바(중립 저채도). **강도**: 채널 과격도 순위(amber 바), 미적재면 '준비중'. ⚠️ `st.image(...) if x else ...` 삼항은 Streamlit magic으로 화면에 새어 나가므로 if/else 문으로 쓴다 |
-| `views/channel_stats.py` | 채널 일별 좌%·우% 시계열. 원시/EMA 전환은 **plotly updatemenus 버튼(클라이언트)** — Streamlit 위젯이면 매번 서버 rerun이라 전환이 뚝뚝 끊긴다. 하단 x축 공유 댓글 수 막대(영상 수 hover). **강도 탭 = 일별 과격도(0~1) 시계열**(같은 원시/EMA 버튼 패턴, amber색), 강도 미적재면 '준비중' |
-| `views/compare.py` | 채널별 '판정 중 우비율' EMA를 한 그래프에 채널 브랜드색으로 겹침 + 50% 균형선. **X축은 선택 채널의 공통 기간(교집합)으로 트림** — 채널마다 소급 깊이가 달라도 공정 비교(EMA는 전체 이력으로 계산 후 보기만 자름). 개별 채널 전체 깊이는 `channel_stats.py`에서. ⚡ 전 채널을 **단일 쿼리 `all_channels_timeseries`**로 집계(채널마다 따로 부르면 61만 행 조인을 10회 반복해 38s→6s로 느렸음) |
-| `queries.py` | DB 집계(모두 `@st.cache_data`). **미분류 배제가 여기 박혀 있다** — `comment_labels`와 inner join이라 미추론 신규 댓글은 자동 제외. `RUN_BY_AXIS`로 축→run_id 매핑. 성향: `channel_summary`/`channel_timeseries`(label 좌/우/중립, unusable 제외)/**`all_channels_timeseries`**(compare용 — 전 채널 일별 좌/우를 `GROUP BY outlet,일`로 한 쿼리에; 채널마다 따로 부르면 61만 행 조인 10회로 느림). **강도**: `has_intensity`(적재 여부)·`channel_intensity_summary`·`channel_intensity_timeseries`(score=과격도, label NULL이라 unusable 필터 없음) |
-| `theme.py` | Sentry 다크 팔레트(`COLORS`)·채널 브랜드색(`CHANNEL_COLORS`)·성향 관례(`CONVENTION`) |
-| `util.py` | `center_spinner()` — 화면 중앙 원형 로딩 스피너 컨텍스트매니저 |
-
-- **미추론 신규 댓글이 계속 쌓여도 결과가 안 흔들린다**(inner join 배제) — collect.py를 켜둔 채 대시보드를 봐도 된다.
-- ⚠️ **`queries.py` 등에 함수를 새로 추가하면 서버를 재시작해야** 반영된다(streamlit이 import한 모듈을 캐시하기 때문).
-- 강도 축은 `RUN_BY_AXIS`·채널 별 통계 "강도" 탭·대시보드 "축" 라디오에 자리가 뚫려 있다 — `model_khaters_v1` 적재 시 연결.
+GitHub Actions에는 `YOUTUBE_API_KEY`·`STAGING_DATABASE_URL` Secrets만 필요하다. 코드는 양쪽에서 동일하게 `os.environ`으로 읽는다.
 
 ## 실행 방법
 
@@ -172,18 +162,27 @@ YouTube Data API                    CockroachDB Cloud (운영 DB)
 cd part1
 pip install -r requirements.txt
 
-python migrate.py     # 스키마 생성/갱신 (운영 DB = CockroachDB, DATABASE_URL 대상)
-python Data/collect.py     # 24시간치 수집 (운영 DB에 적재)
-python Data/backfill.py     # 과거 소급 수집 (필요할 때만, TOTAL_BUDGET 확인 후)
-python Data/prune.py --dry-run    # 하한선보다 오래된 데이터 확인 (--yes로 실제 삭제)
+# 로컬 분석 DB (최초 1회): Docker Desktop 실행 상태에서 컨테이너 newstance-pg가 떠 있어야 한다
+docker start newstance-pg     # (--restart unless-stopped라 보통 Docker Desktop과 함께 자동 기동)
+python migrate.py               # 스키마 생성/갱신 — 로컬(DATABASE_URL)
+python migrate.py --staging     # 스키마 생성/갱신 — 스테이징(STAGING_DATABASE_URL)
+
+python Data/sync.py        # ★ 수집분을 로컬로 가져오기 (분석 전에 실행)
+python Data/collect.py     # 24시간치 수집 (스테이징에 적재 — 평소엔 GitHub Actions가 매일 실행)
+python Data/backfill.py     # 과거 소급 수집 (스테이징에 적재)
 
 python AI/infer.py     # 전체 댓글 추론·적재 (기본 models/kcelectra_v2, run_id=model_kcelectra_v2)
 
-cd viz && streamlit run app.py     # 시각화 대시보드 (로컬 브라우저)
+# 시각화는 크롬 익스텐션(part2/)이 맡는다 — chrome://extensions → 개발자 모드 → '압축해제된 확장 프로그램 로드' → part2/
+python ../part2/tools/export_data.py   # Part 1 결과를 익스텐션용 정적 JSON으로 추출(갱신 시)
 ```
 
 ## 삭제된 파일
 
+- `viz/`(Streamlit 대시보드) — 2026-09-26 삭제. 결과 시각화는 크롬 익스텐션(part2 `analysis.html`)이 맡는다. 대시보드가 원격 DB에 대량 집계를 반복한 것이 CockroachDB 사용량의 주요 원인 후보이기도 했다(`../DECISIONS.md` 09-26).
+- `Data/prune.py` — 하한선 밑 데이터를 지우는 도구. 원래 Neon 512MB 용량 때문에 만들었는데, backfill이 하한에서 멈춰 하한 밑 데이터가 생기지 않고 용량 제약도 없어져 2026-09-26 삭제. `RETENTION_FLOOR`는 `backfill.py`로 옮겼다.
+- `train.py --labels human-first` 분기 — 맹검 100건을 사람 라벨로 바꿔 학습하던 실험(07-26 (5), 결과 '사실상 동률'). 최종 모델에 쓰이지 않아 삭제.
+- `keywords.py`의 `load_political_keywords()`·`INCLUDE_CATEGORIES` — 키워드를 국내 고유/일반 두 갈래로 나누기 전의 옛 API. 호출처가 없어 삭제.
 - `db.py` — test/운영 DB 분리(`ensure_test_database`)를 담당했으나, 필터 검증 후 `collect_test`를 운영 DB `newstance`로 rename·승격하면서 분리가 불필요해져 삭제(2026-08-03). 각 스크립트는 이제 `DATABASE_URL`에 직접 연결하며, 이때 각 파일의 `sys.path` 부트스트랩도 함께 제거했다.
 - `quick_test.py` — API 연결 확인용 임시 스크립트였고, 기능(채널 조회 → 영상 목록 → 댓글 수집 + `commentsDisabled` 예외처리)이 전부 `collect.py`에 흡수돼서 삭제함
 - 일회성 진단 스크립트 다수(드리프트 검정, 용량 측정, 채널 검증, 라벨 검토 등) — 결론만 `../DECISIONS.md`에 남기고 스크립트는 삭제. 전부 특정 시점의 DB 상태를 전제로 한 것이라 나중에 다시 돌려도 같은 답이 안 나온다

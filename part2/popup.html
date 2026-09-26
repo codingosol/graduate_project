@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="lib/ui.css" />
+    <style>
+      body { width: 380px; background: var(--page); }
+      .head { display: flex; align-items: center; gap: 10px; padding: 16px 18px 12px; }
+      .logo { width: 30px; height: 30px; border-radius: 9px; flex: none; display: grid; place-items: center;
+              background: var(--ink); }
+      .logo i { display: block; width: 16px; height: 8px; border-radius: 2px;
+                background: linear-gradient(90deg, var(--c-left) 0 33%, var(--c-center) 33% 66%, var(--c-right) 66%); }
+      .head h1 { font-size: 15px; }
+      .head p { margin: 0; color: var(--muted); font-size: 12px; }
+      main { padding: 0 18px; min-height: 250px; }
+      .kpis { grid-template-columns: 1fr 1fr; }
+      .panel { margin-top: 10px; }
+      .panel .card-title { display: flex; justify-content: space-between; align-items: baseline; }
+      .panel .card-title span { color: var(--muted); font-size: 12px; font-weight: 400; }
+      .legend { display: grid; grid-template-columns: repeat(3, auto); justify-content: space-between; gap: 6px 8px; font-size: 12.5px; }
+      .legend .it { gap: 5px; }
+      .summary { margin: 12px 0 0; font-size: 13px; color: var(--ink-2); }
+      .summary b { color: var(--ink); }
+      .empty { text-align: center; padding: 34px 12px; color: var(--ink-2); }
+      .empty .ico { font-size: 28px; margin-bottom: 6px; }
+      .empty p { margin: 4px 0 0; color: var(--muted); font-size: 12.5px; }
+      footer { padding: 14px 18px 16px; }
+      footer .btn { width: 100%; }
+    </style>
+  </head>
+  <body>
+    <header class="head">
+      <div class="logo" aria-hidden="true"><i></i></div>
+      <div>
+        <h1>내 피드 정치 성향</h1>
+        <p id="ctx">현재 탭에 보이는 영상 기준</p>
+      </div>
+    </header>
+
+    <main id="main" aria-live="polite">
+      <!-- 로딩: 레이아웃이 튀지 않도록 결과와 같은 뼈대 -->
+      <div class="kpis" aria-hidden="true">
+        <div class="kpi"><div class="skel" style="height:12px;width:60%"></div><div class="skel" style="height:26px;width:45%;margin-top:8px"></div></div>
+        <div class="kpi"><div class="skel" style="height:12px;width:60%"></div><div class="skel" style="height:26px;width:45%;margin-top:8px"></div></div>
+      </div>
+      <div class="card panel" aria-hidden="true"><div class="skel" style="height:14px;width:40%"></div>
+        <div class="skel" style="height:28px;margin-top:14px"></div><div class="skel" style="height:12px;width:80%;margin-top:12px"></div></div>
+    </main>
+
+    <footer>
+      <button id="detail" class="btn">시청기록 상세 분석 <span class="arrow" aria-hidden="true">→</span></button>
+    </footer>
+
+    <script src="lib/keywords.gen.js"></script>
+    <script src="lib/politics.js"></script>
+    <script src="lib/leaning.js"></script>
+    <script src="lib/viz.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

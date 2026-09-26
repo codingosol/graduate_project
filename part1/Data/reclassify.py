@@ -9,7 +9,7 @@
 수집 시점의 판정을 신뢰하지 않고 **항상 현재 기준으로 다시 매기는** 방식이라 몇 번을 실행해도 안전하다.
 데이터를 지우지 않고 플래그만 갱신하므로 되돌릴 수 있다.
 
-    python reclassify.py            # 운영 DB 대상, 변경 내역 요약 출력
+    python reclassify.py            # 로컬 분석 DB 대상, 변경 내역 요약 출력
     python reclassify.py --dry-run  # 실제로 쓰지 않고 무엇이 바뀔지만 확인
 """
 

@@ -20,7 +20,6 @@ DOMESTIC_CATEGORIES = [
 # (예: "트럼프 부정선거 관련 대국민 연설" — '대통령'·'부정선거'만 걸림).
 GENERIC_CATEGORIES = ["institutions_terms"]
 
-INCLUDE_CATEGORIES = DOMESTIC_CATEGORIES + GENERIC_CATEGORIES
 EXCLUDE_CATEGORY = "exclude_foreign_leaders"
 
 
@@ -36,15 +35,6 @@ def normalize(text):
       NFC가 호환용 한자를 표준 한자로 정규화한다(U+F9E1 → U+674E).
     """
     return unicodedata.normalize("NFC", text)
-
-
-def load_political_keywords():
-    """(포함 키워드, 제외 키워드) 2-튜플. 기존 호출부 호환용.
-
-    국내 고유/일반 용어 구분이 필요한 쪽은 `load_keyword_groups()`를 쓴다.
-    """
-    domestic, generic, exclude = load_keyword_groups()
-    return domestic + generic, exclude
 
 
 def load_keyword_groups():

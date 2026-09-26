@@ -65,7 +65,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     conn = psycopg2.connect(url)
-    train_rows, eval_rows, _ = load_data(conn, "llm")
+    train_rows, eval_rows = load_data(conn)
     conn.close()
 
     y_true = np.array([r[1] for r in eval_rows])

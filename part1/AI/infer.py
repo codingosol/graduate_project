@@ -5,13 +5,13 @@
 무작위 오차가 상쇄돼 순위는 안정적으로 나온다.
 
 설계 원칙:
-  1. **Neon 접근은 앞뒤 한 번씩만.** 추론 중(수십 분)에는 DB를 건드리지 않는다.
+  1. **DB 접근은 앞뒤 한 번씩만.** 추론 중(수십 분)에는 DB를 건드리지 않는다.
      시작에 댓글을 한 번 fetch → GPU로 전부 추론 → 완료 후 결과를 청크로 배치 UPSERT.
-     추론 도중 매 배치마다 DB에 쓰면 무료 티어에 연결·부하 문제가 생긴다.
+     대상은 로컬 분석 DB(DATABASE_URL)다 — 원격 DB에 대량 적재를 붙이지 않는다(DECISIONS 09-26).
   2. **2축 확장 대비.** 스키마(label_runs.axis)가 이미 leaning/intensity를 구분한다.
-     축별 후처리를 AXIS_CONFIG로 분리해, 나중에 강도 축(K-HATERS 모델)은 함수 하나만 추가하면 된다.
+     축별 후처리를 AXIS_CONFIG로 분리했다.
         - leaning  : label=argmax(좌/우/중립/불가), score=P(우)−P(좌)
-        - intensity: (미구현) label=NULL, score=0~1 과격도 — K-HATERS 모델 붙일 때 작성
+        - intensity: label=NULL, score=기대 서열/3 = 0~1 과격도 (K-HATERS 파인튜닝 모델)
   3. **진행률이 파이프에 갇히지 않게** flush로 출력하고 `results/<run_id>.progress`에도 기록한다.
      (백그라운드 실행 시 그 파일을 tail 하면 어디까지 됐는지 보인다.)
   4. **DB뿐 아니라 로컬에도** 요약을 남긴다: `results/<run_id>.txt`(채널 순위·분포·메타).

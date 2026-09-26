@@ -34,7 +34,7 @@ MAX_LOOKBACK = timedelta(days=7)       # 재개 구간 상한. 이보다 벌어�
 CHANNEL_WORKERS = 5  # 1단계: 채널별 메타데이터/영상목록 조회 동시 실행 수
 VIDEO_WORKERS = 10  # 2단계: 영상별 댓글 조회 동시 실행 수
 DB_POOL_SIZE = VIDEO_WORKERS + 4  # ThreadedConnectionPool은 풀이 바닥나면 대기 없이 바로 예외를 던지므로,
-# 동시 작업자 수(VIDEO_WORKERS)보다 넉넉하게 잡아야 함. 운영 DB(CockroachDB) 연결 한도엔 충분히 여유 있음.
+# 동시 작업자 수(VIDEO_WORKERS)보다 넉넉하게 잡아야 함. 스테이징 DB(Neon) 연결 한도 안이다.
 
 # outlet_name -> [(key_type, key_value, channel_type), ...]
 # key_type: "handle"(@핸들) | "id"(채널ID) | "username"(레거시 /user/ 이름)
@@ -231,8 +231,8 @@ def build_comment_row(comment_thread, video_id):
 # (페이지 단위 과금이라 적게 요청해도 quota가 안 줄어든다), **저장은 20건만** 한다.
 #
 # 왜 자르는가:
-#   Neon 무료 티어 512MB에서 영상 1편이 13.4KB(실측)를 먹어, 하한선까지 소급하면 615MB로
-#   한도를 넘는다. 게다가 한 영상 안의 댓글은 같은 주제·같은 시청자라 서로 강하게 상관돼서
+#   처음 계기는 옛 Neon 512MB 용량(영상 1편 13.4KB 실측)이었지만, 용량 제약이 없는 지금도 유지한다.
+#   한 영상 안의 댓글은 같은 주제·같은 시청자라 서로 강하게 상관돼서
 #   41건이 41개의 독립 표본이 아니다. 채널 성향 추정에는 **영상 수**가 훨씬 값지므로
 #   댓글 밀도를 줄이고 기간을 지키는 쪽을 택했다.
 #
@@ -463,11 +463,12 @@ def main():
     start_time = time.perf_counter()
 
     api_key = os.environ.get("YOUTUBE_API_KEY")
-    database_url = os.environ.get("DATABASE_URL")
+    # 수집분은 스테이징 DB(Neon)에만 쓴다. 로컬 분석 DB(DATABASE_URL)로는 Data/sync.py가 옮긴다.
+    database_url = os.environ.get("STAGING_DATABASE_URL")
     if not api_key or not database_url:
-        raise SystemExit("YOUTUBE_API_KEY / DATABASE_URL 환경변수가 필요합니다.")
+        raise SystemExit("YOUTUBE_API_KEY / STAGING_DATABASE_URL 환경변수가 필요합니다.")
 
-    print("=== 일일 수집 시작 (운영 DB = DATABASE_URL) ===")
+    print("=== 일일 수집 시작 (스테이징 DB = STAGING_DATABASE_URL) ===")
 
     bootstrap_youtube = make_youtube_client(api_key)
     category_names = fetch_category_names(bootstrap_youtube)
@@ -574,7 +575,7 @@ def main():
     elapsed = time.perf_counter() - start_time
     print(f"\n[단계별] 1단계(채널/영상목록) {stage1_elapsed:.1f}초 / 2단계(댓글수집) {stage2_elapsed:.1f}초")
     TIMINGS.report(stage2_elapsed, VIDEO_WORKERS)
-    print(f"\n=== 완료: 운영 DB에 저장됨 — 총 소요시간 {elapsed:.1f}초 ===")
+    print(f"\n=== 완료: 스테이징 DB에 저장됨 — 총 소요시간 {elapsed:.1f}초 ===")
     # GitHub Actions가 파싱해 backfill에 넘길 '남은 쿼터'를 계산한다(마지막 줄, 고정 형식).
     print(f"QUOTA_SPENT={QUOTA.units}")
 

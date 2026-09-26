@@ -19,3 +19,9 @@ part1/.venv/
 # 메인 프로젝트(수집·필터·분류 파이프라인)의 산출물이 아니므로 원격에 올리지 않음
 labeling_tool/
 results/
+
+# 보고서 초안 — 계획 문서와 동일하게 추적하지 않음
+report/
+
+# 개인 Google Takeout 시청기록(원본 데이터) — 공개 저장소에 절대 올리지 않음
+Takeout/

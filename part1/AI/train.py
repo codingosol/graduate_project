@@ -24,7 +24,8 @@
 
 사용법:
   python train.py                      # 기본: LLM 라벨 700건으로 학습
-  python train.py --labels human-first # 맹검 100건은 사람 라벨로 교체해 학습
+  python train.py --train-run llm_train_v2_big --epochs 15 --class-weights --save ../models/kcelectra_v2
+                                       # 최종 모델 설정(v2 라벨 1000건, DECISIONS 08-03 (5))
   python train.py --curve              # 100/250/500/700 학습곡선
   python train.py --save models/v1     # 모델 저장
 """
@@ -51,7 +52,6 @@ KO = {"left": "좌", "right": "우", "neutral": "중립", "unusable": "불가"}
 
 EVAL_RUN = "manual_gold_v1"   # 사람 손라벨 — 채점 전용, 학습 금지
 TRAIN_RUN = "llm_train_v1"    # LLM 라벨 — 학습용
-HUMAN_RUN = "blind_check_v1"  # 맹검 재라벨 — TRAIN_RUN과 100건 겹침(의도된 것)
 
 MAX_LEN = 128   # 댓글 평균 45.7자라 충분하다. 길이를 늘리면 메모리만 먹는다.
 
@@ -68,12 +68,9 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def load_data(conn, label_source, train_run=TRAIN_RUN):
+def load_data(conn, train_run=TRAIN_RUN):
     """학습셋과 평가셋을 DB에서 읽는다.
 
-    label_source:
-      'llm'         — 학습 라벨 전부 LLM이 매긴 것 (기본)
-      'human-first' — 같은 댓글에 사람 라벨(맹검)이 있으면 그것으로 교체
     train_run:
       학습셋 run_id. 기본 llm_train_v1. 라벨 재생성 실험(v2 등)에서 바꿔 넣는다.
     """
@@ -112,23 +109,9 @@ def load_data(conn, label_source, train_run=TRAIN_RUN):
     )
     tr = cur.fetchall()
 
-    swapped = 0
-    if label_source == "human-first":
-        cur.execute(
-            "SELECT comment_id, label FROM comment_labels WHERE run_id = %s", (HUMAN_RUN,)
-        )
-        human = dict(cur.fetchall())
-        out = []
-        for cid, text, lab in tr:
-            h = human.get(cid)
-            if h and h != lab:
-                swapped += 1
-            out.append((cid, text, h or lab))
-        tr = out
-
     train = [(t, L2I[l]) for _, t, l in tr]
     evalset = [(t, L2I[l], ch) for t, l, ch in ev]
-    return train, evalset, swapped
+    return train, evalset
 
 
 def encode(tokenizer, texts):
@@ -339,8 +322,6 @@ def tune_and_evaluate(train_rows, eval_loader, y_true, channels, tokenizer, args
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description="댓글 성향 분류기 학습")
-    p.add_argument("--labels", choices=["llm", "human-first"], default="llm",
-                   help="학습 라벨 출처. human-first는 맹검 100건을 사람 라벨로 교체")
     p.add_argument("--train-run", default=TRAIN_RUN,
                    help="학습셋 run_id (기본 llm_train_v1). 라벨 재생성 실험에서 바꾼다")
     p.add_argument("--epochs", type=int, default=4)
@@ -367,13 +348,11 @@ def main():
         print("⚠️ GPU를 찾지 못했습니다. CPU로도 돌아가지만 수십 배 느립니다.\n")
 
     conn = psycopg2.connect(url)
-    train_rows, eval_rows, swapped = load_data(conn, args.labels, args.train_run)
+    train_rows, eval_rows = load_data(conn, args.train_run)
     conn.close()
 
     print(f"학습 {len(train_rows)}건 / 평가 {len(eval_rows)}건   "
-          f"라벨 출처: {args.labels}  run: {args.train_run}")
-    if swapped:
-        print(f"  사람 라벨로 교체된 것 {swapped}건 (나머지는 두 라벨이 같았음)")
+          f"학습 run: {args.train_run}")
     tc = Counter(y for _, y in train_rows)
     print("  학습 분포:", "  ".join(f"{KO[l]} {tc.get(i,0)}" for i, l in enumerate(LABELS)))
     print(f"  모델 {MODEL_NAME} / {device} / batch {args.batch} / epochs {args.epochs}"
